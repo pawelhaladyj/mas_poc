@@ -1,5 +1,7 @@
 #srodowisko
 .venv
+.env
 
 #notatki
 notes.txt
+
