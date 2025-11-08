@@ -23,7 +23,7 @@ except Exception as e:
 
 from spade.agent import Agent
 from spade.message import Message
-from spade.behaviour import CyclicBehaviour
+from spade.behaviour import CyclicBehaviour, OneShotBehaviour, PeriodicBehaviour
 
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
@@ -43,6 +43,26 @@ KB_LOG_LEVEL = (_getenv("KB_LOG_LEVEL", "INFO") or "INFO").upper()
 # XMPP bezpieczeństwo / rejestracja
 KB_VERIFY_SECURITY = _getenv("KB_VERIFY_SECURITY", "1")  # "1" (domyślnie): ścisły TLS; "0": poluzuj
 KB_AUTO_REGISTER   = _getenv("KB_AUTO_REGISTER", "0")    # "1": spróbuj in-band register (jeśli serwer pozwala)
+
+# DF / rejestracja w registry
+DF_JID = _getenv("DF_JID", "registry@xmpp.pawelhaladyj.pl")
+KB_NAME = _getenv("KB_NAME", "KB-Agent")
+
+_DEFAULT_KB_DESCRIPTION = (
+    "Append-only Knowledge Base for MAS. Przechowuje i udostępnia fakty/artefakty konwersacji "
+    "(JSON) w celu przekazywania stanu między agentami. Klucz: 5 segmentów [a-z0-9._-] "
+    "np. 'session:{id}:domain:entity:key'. Operacje: STORE (z if_match: 'vN' lub ETag) oraz GET "
+    "(najnowsza/konkretna wersja lub 'as_of' timestamp). Więź: wyłącznie przez Koordynatora "
+    "(whitelist JID). Zastosowania: po ekstrakcji slotów (Extractor) zapisz FACTy; po wynikach "
+    "specjalisty zapisz OUTPUT; przed dispatch kolejnego specjalisty odczytaj wymagane dane; "
+    "używaj tagów do filtrowania (np. ['facts','offers','nlu']). Spójność: brak mutacji wstecz, "
+    "konflikty rozstrzygane if_match. Przewidywany TTL wpisu w DF utrzymywany heartbeatem."
+)
+KB_DESCRIPTION = _getenv("KB_DESCRIPTION", _DEFAULT_KB_DESCRIPTION)
+
+_cap_raw = _getenv("KB_CAPABILITIES", "KB.STORE,KB.GET") or ""
+KB_CAPABILITIES = [s.strip() for s in _cap_raw.split(",") if s.strip()]
+KB_HEARTBEAT_SEC = int(_getenv("KB_HEARTBEAT_SEC", "30"))
 
 # ====== stałe/regex ======
 KEY_RE = re.compile(r"^[a-z0-9._-]+:[a-z0-9._-]+:[a-z0-9._-]+:[a-z0-9._-]+:[a-z0-9._-]+$")
@@ -67,6 +87,19 @@ def _mask_dsn(dsn: str) -> str:
         return f"{prefix}://{creds}@{tail}"
     except Exception:
         return dsn
+
+def _acl_df_base(**extra) -> Dict[str, Any]:
+    base = {
+        "ontology": "MAS.DF",
+        "protocol": "fipa-request",
+        "language": "application/json",
+        "timestamp": now_iso(),
+        "conversation_id": f"df-{uuid.uuid4().hex}",
+        "sender": "KB",
+        "receiver": "DF",
+    }
+    base.update(extra)
+    return base
 
 # ====== DB WARSTWA ======
 class KBStorage:
@@ -373,6 +406,38 @@ class KBCycle(CyclicBehaviour):
         if self.agent.log_info:
             print(f"[KB] {now_iso()} {code} conv={conv} from={bare(getattr(msg, 'sender', None))} reason={reason}")
 
+# ====== DF REGISTER + HEARTBEAT ======
+class KBRegisterOnce(OneShotBehaviour):
+    async def run(self):
+        body = _acl_df_base(
+            performative="REQUEST",
+            type="REGISTER",
+            agent={
+                "jid": str(self.agent.jid),
+                "name": KB_NAME,
+                "description": KB_DESCRIPTION,
+                "capabilities": KB_CAPABILITIES,
+                "status": "ready",
+                "ttl_sec": KB_HEARTBEAT_SEC * 3,
+            },
+        )
+        msg = Message(to=DF_JID)
+        msg.body = json.dumps(body, ensure_ascii=False)
+        await self.send(msg)
+        if getattr(self.agent, "log_info", True):
+            print(f"[KB] {now_iso()} REGISTER sent to {DF_JID} name={KB_NAME} caps={KB_CAPABILITIES}")
+
+class KBHeartbeat(PeriodicBehaviour):
+    async def run(self):
+        body = _acl_df_base(
+            performative="INFORM",
+            type="HEARTBEAT",
+            agent={"jid": str(self.agent.jid), "status": "ready"}
+        )
+        msg = Message(to=DF_JID)
+        msg.body = json.dumps(body, ensure_ascii=False)
+        await self.send(msg)
+
 class KBAgent(Agent):
     def __init__(self, jid: str, password: str, storage: KBStorage, allowed_bare: str, verify_security: bool):
         super().__init__(jid, password, verify_security=verify_security)
@@ -383,6 +448,9 @@ class KBAgent(Agent):
     async def setup(self):
         print(f"[KB] Start jako {self.jid}. Allowed={self.allowed_bare} DB={_mask_dsn(KB_DB_DSN)}")
         self.add_behaviour(KBCycle())
+        # Rejestracja w DF + Heartbeat
+        self.add_behaviour(KBRegisterOnce())
+        self.add_behaviour(KBHeartbeat(period=KB_HEARTBEAT_SEC))
 
 # ====== MAIN ======
 async def amain():

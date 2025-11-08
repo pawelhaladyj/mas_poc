@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-# Coordinator – USER_MSG -> DF lookup -> REQUEST.ASK_EXPERT -> RESULT -> PRESENTER_REPLY
-# Wersja z dyspozytorem i kolejkami per-rozmowa (brak wyścigu o receive), poprawione logi.
+# Coordinator – USER_MSG -> DF lookup -> AI select -> REQUEST.ASK_EXPERT -> RESULT -> PRESENTER_REPLY
+# Wersja z dyspozytorem i kolejkami per-rozmowa, wybór kandydata przez OpenAI (AIConnector).
 
 import os
 import json
 import time
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 # --- dotenv (opcjonalnie) ---
 try:
@@ -19,9 +19,75 @@ try:
 except Exception as e:
     print(f"[COORD] Uwaga: problem z dotenv: {e} (kontynuuję).")
 
+# --- SPADE ---
 from spade.agent import Agent
 from spade.message import Message
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour
+
+# --- AI Connector (ścieżki jak w zrzucie) ---
+from utils.aiconnector import AIConnector  # nazwa z drzewa plików
+
+
+# --- System prompt (opcjonalnie z pliku systemprompt.py) ---
+SELECTOR_SYSTEM_PROMPT: Optional[str] = None
+try:
+    # Jeżeli w repo jest plik systemprompt.py z tekstem promptu
+    from systemprompt import SELECTOR_SYSTEM_PROMPT as _SP  # type: ignore
+    SELECTOR_SYSTEM_PROMPT = _SP
+except Exception:
+    # Fallback – treść z polecenia
+    SELECTOR_SYSTEM_PROMPT = (
+        "Jesteś selektorem agentów.\n\n"
+        "Wejście:\n"
+        "W wiadomości użytkownika otrzymasz obiekt JSON o następującej strukturze (dane rzeczywiste; bez dodatkowych kluczy poza opisanymi):\n\n"
+        "- conversation_id\n"
+        "- required_capability\n"
+        "- df_timestamp\n"
+        "- fipa_request: { performative, ontology, sender, content: { type, args: { question, domain_tags }, ... } }\n"
+        "- candidates: lista obiektów { jid, name, description, capabilities, skills, status }\n\n"
+        "Zadanie (kolejno):\n"
+        "1) Rozpatrz wyłącznie tych kandydatów, którzy mają status wskazujący dostępność oraz posiadają required_capability.\n"
+        "2) Dopasuj merytorycznie kandydatów do domain_tags z fipa_request.content.args (porównanie z candidates[*].skills).\n"
+        "3) W przypadku remisu wybierz deterministycznie (np. alfabetycznie po jid).\n\n"
+        "Format odpowiedzi:\n"
+        "Zwróć WYŁĄCZNIE JSON (bez komentarzy i dodatkowego tekstu) w postaci:\n"
+        "{\n"
+        "  \"selected_jid\": \"<jid wybrany z candidates>\",\n"
+        "  \"reason\": \"<zwięzłe uzasadnienie w 1–2 zdaniach oparte na polach wejścia>\",\n"
+        "  \"confidence\": <liczba od 0 do 1>\n"
+        "}\n\n"
+        "Zakazy:\n"
+        "- Nie twórz nowych kandydatów i nie zgaduj wartości spoza dostarczonego obiektu.\n"
+        "- \"selected_jid\" musi pochodzić z listy \"candidates\".\n\n"
+        "Schemat wejścia (opis pól — przykładowe nazwy kluczy, bez sugerowania typów ani wartości):\n"
+        "{\n"
+        "  \"conversation_id\": \"Jednoznaczny identyfikator rozmowy nadany przez system źródłowy.\",\n"
+        "  \"required_capability\": \"Wymagana zdolność funkcjonalna użyta do doboru agenta.\",\n"
+        "  \"df_timestamp\": \"Znacznik czasu wygenerowania listy kandydatów, przekazany bez zmiany formatu.\",\n"
+        "  \"fipa_request\": {\n"
+        "    \"performative\": \"Performatyw FIPA-ACL oryginalnego żądania do Koordynatora.\",\n"
+        "    \"ontology\": \"Nazwa ontologii przypisana do tego żądania.\",\n"
+        "    \"sender\": \"Logiczna nazwa nadawcy z koperty FIPA-ACL.\",\n"
+        "    \"content\": {\n"
+        "      \"type\": \"Rodzaj treści żądania (np. USER_MSG).\",\n"
+        "      \"args\": {\n"
+        "        \"question\": \"Treść pytania przekazana przez nadawcę.\",\n"
+        "        \"domain_tags\": \"Lista etykiet tematycznych opisujących domenę zadania.\"\n"
+        "      }\n"
+        "    }\n"
+        "  },\n"
+        "  \"candidates\": [\n"
+        "    {\n"
+        "      \"jid\": \"Pełny identyfikator XMPP agenta kandydata.\",\n"
+        "      \"name\": \"Czytelna nazwa agenta pochodząca z rejestru.\",\n"
+        "      \"description\": \"Opis kompetencji i zakresu działania agenta.\",\n"
+        "      \"capabilities\": \"Lista zadeklarowanych zdolności funkcjonalnych agenta.\",\n"
+        "      \"skills\": \"Lista obszarów umiejętności lub domen merytorycznych agenta.\",\n"
+        "      \"status\": \"Bieżący stan dostępności agenta według rejestru.\"\n"
+        "    }\n"
+        "  ]\n"
+        "}"
+    )
 
 # ====== ENV ======
 def _env(*names: str, default: Optional[str] = None) -> Optional[str]:
@@ -76,6 +142,8 @@ class CoordinatorAgent(Agent):
         # Kontrola współbieżności rozmów
         self.sem = asyncio.Semaphore(MAX_CONCURRENCY)
         self.registry_jid = REGISTRY_JID
+        # Pojedynczy, współdzielony konektor AI (wątki → równoległość)
+        self.ai = AIConnector()
 
     # ---------- Behawiory ----------
     class Dispatcher(CyclicBehaviour):
@@ -103,7 +171,6 @@ class CoordinatorAgent(Agent):
 
             # Echo finalnej odpowiedzi – ignorujemy, żeby nie śmiecić logów
             if pf == "INFORM" and typ == "PRESENTER_REPLY":
-                # Opcjonalnie: print(f"[DISP] {now_iso()} Echo PRESENTER_REPLY – ignoruję")
                 return
 
             # USER_MSG → start rozmowy
@@ -114,13 +181,20 @@ class CoordinatorAgent(Agent):
 
                 if conv not in self.agent.conv_queues:
                     self.agent.conv_queues[conv] = asyncio.Queue()
+
                     presenter_jid = (cont.get("meta") or {}).get("presenter_jid") or str(msg.sender)
                     question = (cont.get("args") or {}).get("question") or ""
-                    print(f"[COORD] {now_iso()} ← USER_MSG od {presenter_jid} conv={conv} q={question!r}")
+
+                    # Przekazujemy ORYGINALNY ACL do behawioru (by zbudować fipa_request w prompt dla AI)
                     self.agent.add_behaviour(
-                        CoordinatorAgent.ServeConversation(presenter_jid, question, conv)
+                        CoordinatorAgent.ServeConversation(
+                            presenter_jid=presenter_jid,
+                            question=question,
+                            conv_id=conv,
+                            orig_acl=acl,
+                        )
                     )
-                # NIE wkładamy USER_MSG do kolejki rozmowy — unikamy „niespodziewane pf=REQUEST”
+                    print(f"[COORD] {now_iso()} ← USER_MSG od {presenter_jid} conv={conv} q={question!r}")
                 return
 
             # Inne wiadomości – kieruj do kolejki po conversation_id
@@ -132,22 +206,23 @@ class CoordinatorAgent(Agent):
             if q:
                 await q.put(msg)
                 print(f"[COORD] {now_iso()} Dyspozytor: dostarczono pf={pf} typ={typ} do conv={conv}")
-            else:
-                # Po zakończeniu rozmowy może jeszcze przyjść spóźniona ramka – nie traktujemy tego jako błąd
-                # Opcjonalnie: print(f"[DISP] {now_iso()} Spóźniona ramka conv={conv} pf={pf} typ={typ} – ignoruję")
-                pass
+            # Późne ramki po sprzątaniu kolejki – ignorujemy bez hałasu
 
     class ServeConversation(OneShotBehaviour):
         """Obsługa jednej rozmowy end-to-end w ramach własnej kolejki."""
-        def __init__(self, presenter_jid: str, question: str, conv_id: str):
+        def __init__(self, presenter_jid: str, question: str, conv_id: str, orig_acl: Dict[str, Any]):
             super().__init__()
             self.presenter_jid = presenter_jid
             self.question = question
             self.conv_id = conv_id
+            self.orig_acl = orig_acl  # pełny FIPA ACL, potrzebny do promptu dla AI
 
         # --- Pomocnicze: wysyłka/odbiór *z poziomu behawioru* ---
-        async def df_lookup(self) -> list[str]:
-            """Zapytaj DF o kandydatów ASK_EXPERT. Zwraca listę JID-ów."""
+        async def df_lookup(self) -> List[Any]:
+            """
+            Zapytaj DF o kandydatów ASK_EXPERT.
+            Zwraca listę: albo JID-ów (str), albo rozszerzonych profili (dict).
+            """
             reply_id = f"dfq-{int(time.time()*1000)}"
             msg = Message(to=self.agent.registry_jid)
             msg.set_metadata("conv", self.conv_id)
@@ -178,7 +253,6 @@ class CoordinatorAgent(Agent):
                     continue
 
                 if acl.get("conversation_id") != self.conv_id:
-                    print(f"[COORD] {now_iso()} [DF] inna rozmowa (conv={acl.get('conversation_id')}) – ignoruję")
                     continue
 
                 pf = acl.get("performative")
@@ -188,10 +262,114 @@ class CoordinatorAgent(Agent):
                     print(f"[COORD] {now_iso()} ← DF INFORM candidates={candidates} conv={self.conv_id}")
                     return candidates
 
-                print(f"[COORD] {now_iso()} [DF] niespodziewane pf={pf} conv={self.conv_id}")
-
             print(f"[COORD] {now_iso()} [DF] timeout po {REQ_TIMEOUT_S}s conv={self.conv_id}")
             return []
+
+        def _normalize_candidates(self, raw_list: List[Any]) -> List[Dict[str, Any]]:
+            """
+            Przyjmuje listę z DF (str JID lub dict profile) i buduje listę obiektów
+            {jid, name, description, capabilities, skills, status} – minimalny zestaw dla selektora.
+            """
+            norm: List[Dict[str, Any]] = []
+            for item in raw_list:
+                if isinstance(item, str):
+                    # DF zwrócił tylko JID – tworzymy minimalny profil (status: online – DF przefiltrował nieżywe)
+                    norm.append({
+                        "jid": item,
+                        "name": item,
+                        "description": "",
+                        "capabilities": [NEED_CAP],
+                        "skills": [],
+                        "status": "online",
+                    })
+                elif isinstance(item, dict):
+                    # Staramy się wydobyć wskazane pola; reszta – bez zgadywania
+                    norm.append({
+                        "jid": item.get("jid", ""),
+                        "name": item.get("name", item.get("jid", "")),
+                        "description": item.get("description", ""),
+                        "capabilities": item.get("capabilities", []),
+                        "skills": item.get("skills", []),
+                        "status": item.get("status", "online"),
+                    })
+                else:
+                    # Nieznany typ – ignorujemy
+                    continue
+            # Filtr bezpieczeństwa: bez pustych JID
+            return [c for c in norm if c.get("jid")]
+
+        def _build_fipa_request_for_prompt(self) -> Dict[str, Any]:
+            """Wyciąga z oryginalnego ACL tylko pola wymagane w prompt-cie."""
+            content = self.orig_acl.get("content") or {}
+            args = (content.get("args") or {})
+            # Domain tags mogą nie wystąpić – normalizujemy do listy
+            domain_tags = args.get("domain_tags") or []
+            if not isinstance(domain_tags, list):
+                domain_tags = [domain_tags]
+
+            return {
+                "performative": self.orig_acl.get("performative"),
+                "ontology": self.orig_acl.get("ontology"),
+                "sender": self.orig_acl.get("sender"),
+                "content": {
+                    "type": content.get("type"),
+                    "args": {
+                        "question": args.get("question"),
+                        "domain_tags": domain_tags
+                    }
+                }
+            }
+
+        async def _ai_select_candidate(self, candidates: List[Dict[str, Any]]) -> Optional[str]:
+            """Wywołuje AI z promptem selektora i zwraca selected_jid lub None."""
+            if not candidates:
+                return None
+
+            selector_input = {
+                "conversation_id": self.conv_id,
+                "required_capability": NEED_CAP,
+                "df_timestamp": now_iso(),
+                "fipa_request": self._build_fipa_request_for_prompt(),
+                "candidates": candidates,
+            }
+
+            messages = [
+                {"role": "system", "content": SELECTOR_SYSTEM_PROMPT or ""},
+                {"role": "user", "content": json.dumps(selector_input, ensure_ascii=False)},
+            ]
+
+            # Asynchroniczne wywołanie – w wątku (równoległe użycie)
+            res = await self.agent.ai.achat_from_history(
+                messages,
+                caller="Coordinator",
+                extra={"response_format": {"type": "json_object"}}
+            )
+
+            # Obsługa błędów z poziomu konektora (kontekst/429)
+            if res.get("error"):
+                print(f"[COORD] {now_iso()} [AI] ERROR {res['error']}")
+                return None
+
+            txt = (res.get("text") or "").strip()
+            try:
+                data = json.loads(txt) if txt else {}
+            except Exception as e:
+                print(f"[COORD] {now_iso()} [AI] Niepoprawny JSON z selektora: {e} / {txt!r}")
+                return None
+
+            selected = data.get("selected_jid")
+            if not selected:
+                print(f"[COORD] {now_iso()} [AI] Brak selected_jid w odpowiedzi.")
+                return None
+
+            # Weryfikacja: musi pochodzić z listy candidates
+            c_jids = {c["jid"] for c in candidates}
+            if selected not in c_jids:
+                print(f"[COORD] {now_iso()} [AI] selected_jid={selected} nie jest na liście kandydatów.")
+                return None
+
+            print(f"[COORD] {now_iso()} [AI] Wybrano: {selected} (powód={data.get('reason')}, conf={data.get('confidence')})")
+            return selected
 
         async def ask_specialist(self, specialist_jid: str) -> Optional[str]:
             """Wyślij REQUEST.ASK_EXPERT, czekaj na INFORM.RESULT. Zwraca answer albo None."""
@@ -226,7 +404,6 @@ class CoordinatorAgent(Agent):
                     continue
 
                 if acl.get("conversation_id") != self.conv_id:
-                    print(f"[COORD] {now_iso()} [SPEC] inna rozmowa – ignoruję")
                     continue
 
                 pf = acl.get("performative")
@@ -244,7 +421,7 @@ class CoordinatorAgent(Agent):
                     print(f"[COORD] {now_iso()} ← SPEC INFORM.RESULT conv={self.conv_id} answer={ans!r}")
                     return ans
 
-                print(f"[COORD] {now_iso()} [SPEC] niespodziewane pf={pf} typ={typ} conv={self.conv_id}")
+                # Inne ramki – ignorujemy w pętli
 
             print(f"[COORD] {now_iso()} [SPEC] timeout po {REQ_TIMEOUT_S}s conv={self.conv_id}")
             return None
@@ -266,17 +443,39 @@ class CoordinatorAgent(Agent):
                 print(f"[COORD] {now_iso()} [CONV {self.conv_id}] start")
                 try:
                     # 1) DF lookup
-                    candidates = await self.df_lookup()
-                    if not candidates:
+                    raw_candidates = await self.df_lookup()
+                    if not raw_candidates:
                         await self.reply_to_presenter("Brak dostępnych specjalistów (ASK_EXPERT).")
                         return
 
-                    print(f"[COORD] {now_iso()} [CONV {self.conv_id}] Kandydaci DF: {candidates}")
+                    candidates = self._normalize_candidates(raw_candidates)
+                    if not candidates:
+                        await self.reply_to_presenter("Brak poprawnych profili kandydatów.")
+                        return
 
-                    # 2) prosty retry po kandydatach
-                    attempts = 0
+                    print(f"[COORD] {now_iso()} [CONV {self.conv_id}] Kandydaci (norm): {[c['jid'] for c in candidates]}")
+
+                    # 2) Wybór przez AI
+                    selected_jid = await self._ai_select_candidate(candidates)
+
+                    # Fallback deterministyczny (bez AI lub błąd AI)
+                    if not selected_jid:
+                        # filtr: dostępny + ma wymaganą capability
+                        avail = [
+                            c for c in candidates
+                            if str(c.get("status", "")).lower() in ("online", "available", "ready")
+                            and (NEED_CAP in (c.get("capabilities") or []))
+                        ]
+                        prefer = avail if avail else candidates
+                        selected_jid = sorted([c["jid"] for c in prefer])[0]
+                        print(f"[COORD] {now_iso()} [FALLBACK] Wybrano deterministycznie: {selected_jid}")
+
+                    # 3) Próba z wybranym, a potem awaryjnie z pozostałymi
+                    ordered_try = [selected_jid] + [c["jid"] for c in candidates if c["jid"] != selected_jid]
+
                     answer: Optional[str] = None
-                    for jid in candidates:
+                    attempts = 0
+                    for jid in ordered_try:
                         attempts += 1
                         print(f"[COORD] {now_iso()} [CONV {self.conv_id}] Próba {attempts}/{MAX_RETRIES} → {jid}")
                         answer = await self.ask_specialist(jid)
@@ -286,7 +485,7 @@ class CoordinatorAgent(Agent):
                             print(f"[COORD] {now_iso()} [CONV {self.conv_id}] Limit prób {MAX_RETRIES} osiągnięty")
                             break
 
-                    # 3) odpowiedź do Presentera
+                    # 4) Odpowiedź do Presentera
                     if answer:
                         await self.reply_to_presenter(answer)
                     else:
