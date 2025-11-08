@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 # Minimalny Directory Facilitator (DF) – SPADE
 # Obsługa: REGISTER, HEARTBEAT, DEREGISTER, QUERY-REF (need)
-# In-memory; prosto i po staremu.
+# In-memory; po staremu – ale QUERY-REF zwraca także pełne profile kandydatów.
 
 import os
 import json
 import time
+import copy
 import asyncio
 from typing import Dict, List, Any
 
@@ -21,6 +22,7 @@ except Exception as e:
     print(f"[DF] Uwaga: problem z dotenv: {e} (kontynuuję).")
 
 from spade.agent import Agent
+    # ^^^ spaDE importy
 from spade.behaviour import CyclicBehaviour
 from spade.message import Message
 
@@ -68,34 +70,61 @@ def parse_acl(body: str) -> Dict[str, Any]:
 class RegistryAgent(Agent):
     # --- struktury i operacje katalogu ---
     def _upsert_profile(self, profile: Dict[str, Any]) -> None:
-        jid  = profile["jid"]
-        caps = profile.get("capabilities", [])
-        record = {
-            "jid": jid,
-            "name": profile.get("name", jid),
-            "version": profile.get("version", "0.0.0"),
-            "capabilities": list(caps),
-            "description": profile.get("description", ""),
-            "last_seen": time.time(),
-            "status": "online",
-        }
+        """
+        Zapis/aktualizacja profilu. Zachowuje wszystko, co przyszło w REGISTER,
+        nie tylko podstawowe pola. capabilities scala w listę unikalną.
+        """
+        jid = profile["jid"]
+        incoming_caps = profile.get("capabilities", [])
+        # pobierz istniejący lub nowy
+        record = self.catalog.get(jid, {"jid": jid})
+        # domyślne (jeśli brak)
+        record.setdefault("name", jid)
+        record.setdefault("version", "0.0.0")
+        record.setdefault("description", "")
+        record.setdefault("capabilities", [])
+        # merge: dowolne pola z REGISTER zostają (poza jid/type)
+        for k, v in profile.items():
+            if k in ("jid", "type"):
+                continue
+            if k == "capabilities":
+                # unikalna lista
+                cur = set(record.get("capabilities", []))
+                for c in (incoming_caps or []):
+                    cur.add(c)
+                record["capabilities"] = list(cur)
+            else:
+                record[k] = v
+        # last_seen/status zawsze odświeżamy
+        record["last_seen"] = time.time()
+        record["status"] = "online"
         self.catalog[jid] = record
-        # odśwież mapowanie cap -> jids
+
+        # odśwież mapę cap -> jids (przebudowa tylko dla zmienionego jid)
         for c, lst in list(self.cap2jids.items()):
-            if jid in lst:
+            if jid in lst and c not in record.get("capabilities", []):
                 lst.remove(jid)
             if not lst:
                 self.cap2jids.pop(c, None)
-        for c in caps:
+        for c in record.get("capabilities", []):
             self.cap2jids.setdefault(c, [])
             if jid not in self.cap2jids[c]:
                 self.cap2jids[c].append(jid)
 
-    def _touch(self, jid: str) -> None:
-        p = self.catalog.get(jid)
-        if p:
-            p["last_seen"] = time.time()
-            p["status"] = "online"
+    def _touch(self, jid: str, extra: Dict[str, Any] | None = None) -> None:
+        """
+        Aktualizacja znaczników czasu/stanu na bazie HEARTBEAT.
+        Dokleja wszelkie przekazane pola (poza type/jid), np. runtime/quality/metrics.
+        """
+        p = self.catalog.setdefault(jid, {"jid": jid})
+        p["last_seen"] = time.time()
+        p["status"] = (extra or {}).get("status", "online")
+        if extra:
+            for k, v in extra.items():
+                if k in ("jid", "type"):
+                    continue
+                p[k] = v  # pozwalamy na zagnieżdżone dict'y (runtime/quality/…)
+        self.catalog[jid] = p
 
     def _remove(self, jid: str, reason: str = "deregister") -> None:
         if jid in self.catalog:
@@ -111,7 +140,7 @@ class RegistryAgent(Agent):
         ttl = HEARTBEAT_SEC * TTL_MULTIPLIER
         removed = []
         for jid, p in list(self.catalog.items()):
-            delta = now - p["last_seen"]
+            delta = now - p.get("last_seen", 0)
             if delta > ttl:
                 removed.append(jid)
                 self._remove(jid, reason="timeout")
@@ -119,6 +148,13 @@ class RegistryAgent(Agent):
                 p["status"] = "offline"
         if removed:
             print(f"[DF] GC removed (timeout): {removed}")
+
+    def _public_profile(self, jid: str) -> Dict[str, Any]:
+        """
+        Zwraca kopię profilu gotową do wysłania. Przekazujemy „to co wiemy”.
+        """
+        p = self.catalog.get(jid, {"jid": jid})
+        return copy.deepcopy(p)
 
     class DFBehaviour(CyclicBehaviour):
         async def on_start(self):
@@ -170,7 +206,8 @@ class RegistryAgent(Agent):
             elif pf == "INFORM" and typ == "HEARTBEAT":
                 jid = c.get("jid")
                 if jid:
-                    self.agent._touch(jid)
+                    # przekaż całe content (oprócz jid/type) do profilu
+                    self.agent._touch(jid, extra=c)
 
             elif pf == "REQUEST" and typ == "DEREGISTER":
                 jid = c.get("jid")
@@ -190,17 +227,22 @@ class RegistryAgent(Agent):
                 need = c.get("need")
                 cands = self.agent.cap2jids.get(need, [])
                 now = time.time()
-                alive = []
                 ttl_alive = HEARTBEAT_SEC * 2
+
+                alive: List[str] = []
+                profiles: List[Dict[str, Any]] = []
                 for jid in cands:
                     p = self.agent.catalog.get(jid)
-                    if p and now - p["last_seen"] <= ttl_alive:
+                    if p and now - p.get("last_seen", 0) <= ttl_alive:
                         alive.append(jid)
+                        profiles.append(self.agent._public_profile(jid))
 
                 ans = Message(to=str(msg.sender))
                 ans.body = make_acl(
                     "INFORM", "Registry", acl.get("sender", "Unknown"),
-                    content={"candidates": alive},
+                    # ← przekazujemy wszystko co DF wie (per profil),
+                    # jednocześnie zostawiając „candidates” dla wstecznej zgodności.
+                    content={"candidates": alive, "profiles": profiles, "df_timestamp": now_iso()},
                     conversation_id=acl.get("conversation_id"),
                     in_reply_to=acl.get("reply_with"),
                 )
@@ -212,8 +254,8 @@ class RegistryAgent(Agent):
 
     async def setup(self):
         # pamięć DF
-        self.catalog: Dict[str, Dict[str, Any]] = {}
-        self.cap2jids: Dict[str, List[str]] = {}
+        self.catalog: Dict[str, Dict[str, Any]] = {}   # jid -> pełny profil (statyczne + runtime)
+        self.cap2jids: Dict[str, List[str]] = {}       # cap -> list[jid]
         self._last_cleanup = 0.0
         # podpinamy zachowanie
         self.add_behaviour(self.DFBehaviour())
