@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
-# KB-Agent — prosty agent wiedzy (append-only) dla MAS
-# Po staremu: SPADE, PostgreSQL (psycopg2), JSON-ACL, wyłączna brama przez Koordynatora.
+# KB-Agent — append-only KB dla MAS (STORE/GET), zgodny z Koordynatorem:
+# - klucze typu: session:{conv_id}:chat:frame:{ts_ms}
+#                session:{conv_id}:chat:timeline:main
+# - if_match: "vN" lub ETag (uuid)
+# - odpowiedzi: INFORM {type: STORED|VALUE, key, version, etag, content_type, value, stored_at}
 
 import os
 import re
@@ -23,7 +26,7 @@ except Exception as e:
 
 from spade.agent import Agent
 from spade.message import Message
-from spade.behaviour import CyclicBehaviour
+from spade.behaviour import CyclicBehaviour, OneShotBehaviour, PeriodicBehaviour
 
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
@@ -36,13 +39,32 @@ def _getenv(name: str, default: Optional[str] = None) -> Optional[str]:
 
 KB_JID  = _getenv("KB_JID", "")
 KB_PASSWORD = _getenv("KB_PASSWORD", "")
+
 KB_ALLOWED_COORDINATOR_JID = (_getenv("KB_ALLOWED_COORDINATOR_JID", "coordinator@xmpp.pawelhaladyj.pl") or "").split("/")[0].lower()
 KB_DB_DSN = _getenv("KB_DB_DSN", "postgresql://mas:mas@localhost:5432/mas_kb")
 KB_LOG_LEVEL = (_getenv("KB_LOG_LEVEL", "INFO") or "INFO").upper()
 
 # XMPP bezpieczeństwo / rejestracja
-KB_VERIFY_SECURITY = _getenv("KB_VERIFY_SECURITY", "1")  # "1" (domyślnie): ścisły TLS; "0": poluzuj
+KB_VERIFY_SECURITY = _getenv("KB_VERIFY_SECURITY", "1")  # "1": ścisły TLS; "0": poluzuj
 KB_AUTO_REGISTER   = _getenv("KB_AUTO_REGISTER", "0")    # "1": spróbuj in-band register (jeśli serwer pozwala)
+
+# DF / rejestracja w registry
+DF_JID = _getenv("DF_JID", "registry@xmpp.pawelhaladyj.pl")
+KB_NAME = _getenv("KB_NAME", "KB-Agent")
+
+_DEFAULT_KB_DESCRIPTION = (
+    "Append-only Knowledge Base for MAS. Przechowuje i udostępnia fakty/artefakty konwersacji (JSON). "
+    "Klucz: 5 segmentów [a-z0-9._-], np. 'session:{id}:domain:entity:key'. Operacje: STORE (if_match: 'vN' lub ETag) "
+    "oraz GET (najnowsza/konkretna wersja lub 'as_of'). Dostęp wyłącznie przez Koordynatora."
+)
+KB_DESCRIPTION = _getenv("KB_DESCRIPTION", _DEFAULT_KB_DESCRIPTION)
+
+_cap_raw = _getenv("KB_CAPABILITIES")
+if not _cap_raw or not _cap_raw.strip():
+    _cap_raw = "KB.STORE,KB.GET"
+KB_CAPABILITIES = [s.strip() for s in _cap_raw.split(",") if s.strip()]
+
+KB_HEARTBEAT_SEC = int(_getenv("KB_HEARTBEAT_SEC", "30"))
 
 # ====== stałe/regex ======
 KEY_RE = re.compile(r"^[a-z0-9._-]+:[a-z0-9._-]+:[a-z0-9._-]+:[a-z0-9._-]+:[a-z0-9._-]+$")
@@ -56,9 +78,7 @@ def bare(jid: Optional[str]) -> Optional[str]:
     return str(jid).split("/")[0]
 
 def _mask_dsn(dsn: str) -> str:
-    # maskuj hasło w DSN-ie
     try:
-        # postgresql://user:pass@host:port/db -> zamień pass na ***
         prefix, rest = dsn.split("://", 1)
         creds, tail = rest.split("@", 1)
         if ":" in creds:
@@ -71,10 +91,8 @@ def _mask_dsn(dsn: str) -> str:
 # ====== DB WARSTWA ======
 class KBStorage:
     def __init__(self, dsn: str):
-        # Możesz dodać connect_timeout w DSN, jeśli chcesz (np. ...?connect_timeout=5)
         self.pool = SimpleConnectionPool(1, 8, dsn)
         self._ensure_schema()
-        # szybki healthcheck
         conn = self.pool.getconn()
         try:
             with conn:
@@ -127,12 +145,10 @@ class KBStorage:
         created_by: str,
         if_match: Optional[str],
     ) -> Tuple[int, str, str]:
-        """Append-only. Zwraca (version, etag, stored_at). Rzuca ConflictError przy if_match."""
         conn = self.pool.getconn()
         try:
             with conn:
                 with conn.cursor() as cur:
-                    # if_match: "v3" albo ETag
                     if if_match:
                         if if_match.startswith("v") and if_match[1:].isdigit():
                             expected_v = int(if_match[1:])
@@ -171,8 +187,10 @@ class KBStorage:
         prefer: Optional[str] = None,
         version: Optional[int] = None,
         as_of: Optional[str] = None,
-    ) -> Tuple[Dict[str, Any], int, str, str]:
-        """Zwraca (value_json, version, etag, stored_at). Rzuca NotFoundError."""
+    ) -> Tuple[str, Dict[str, Any], int, str, str]:
+        """
+        Zwraca: content_type, value, version, etag, stored_at_iso
+        """
         conn = self.pool.getconn()
         try:
             with conn.cursor() as cur:
@@ -205,7 +223,7 @@ class KBStorage:
                 if not row:
                     raise NotFoundError("No value for key")
                 content_type, value, ver, etag, created_at = row
-                return value, int(ver), etag, created_at.isoformat()
+                return str(content_type), value, int(ver), etag, created_at.isoformat()
         finally:
             self.pool.putconn(conn)
 
@@ -222,15 +240,23 @@ class KBCycle(CyclicBehaviour):
         if not msg:
             return
 
+        # Bezpieczny parse
         try:
             payload = json.loads(msg.body or "{}")
         except Exception:
-            await self._reply_failure(msg, None, code="FAILURE.INVALID_JSON", reason="Body is not valid JSON")
+            return
+
+        sender_bare = (bare(getattr(msg, "sender", None)) or "").lower()
+        ontology = (payload.get("ontology") or "").upper()
+
+        # Ignoruj wszystko poza MAS.KB
+        if ontology != "MAS.KB":
+            if (KB_LOG_LEVEL == "INFO"):
+                print(f"[KB] {now_iso()} ignore non-KB ontology from={sender_bare} ont={ontology}")
             return
 
         conv = payload.get("conversation_id") or payload.get("conversationId")
-        mtype = payload.get("type")
-        sender_bare = (bare(getattr(msg, "sender", None)) or "").lower()
+        mtype = payload.get("type") or (payload.get("content") or {}).get("type")
 
         # Whitelist — tylko Koordynator
         if sender_bare != self.agent.allowed_bare:
@@ -244,20 +270,26 @@ class KBCycle(CyclicBehaviour):
         else:
             await self._reply_refuse(msg, conv, code="REFUSE.UNSUPPORTED_TYPE", reason=str(mtype))
 
-    async def _handle_store(self, msg: Message, p: Dict[str, Any], conv: Optional[str]):
-        key = p.get("key", "")
-        content_type = p.get("content_type", "application/json")
-        value = p.get("value")
-        tags = p.get("tags") or []
-        if_match = p.get("if_match")
+    def _extract(self, p: Dict[str, Any], name: str, default=None):
+        # pozwala na oba style: top-level i content.{...}
+        if name in p:
+            return p.get(name, default)
+        return (p.get("content") or {}).get(name, default)
 
-        if not KEY_RE.match(key):
+    async def _handle_store(self, msg: Message, p: Dict[str, Any], conv: Optional[str]):
+        key = self._extract(p, "key", "")
+        content_type = self._extract(p, "content_type", "application/json")
+        value = self._extract(p, "value", None)
+        tags = self._extract(p, "tags", []) or []
+        if_match = self._extract(p, "if_match", None)
+
+        if not KEY_RE.match(key or ""):
             await self._reply_failure(msg, conv, code="FAILURE.INVALID_KEY",
                                       reason="Key must have 5 segments and allowed chars [a-z0-9._-]")
             return
 
         session_id = None
-        parts = key.split(":", 4)
+        parts = (key or "").split(":", 4)
         if len(parts) >= 2 and parts[0] == "session":
             session_id = parts[1]
 
@@ -265,7 +297,7 @@ class KBCycle(CyclicBehaviour):
             version, etag, stored_at = await asyncio.to_thread(
                 self.agent.storage.store,
                 key, content_type, value, tags, session_id,
-                created_by=self.agent.allowed_bare,
+                created_by=(bare(getattr(msg, "sender", None)) or self.agent.allowed_bare),
                 if_match=if_match,
             )
             await self._reply_inform(msg, conv, {
@@ -283,12 +315,12 @@ class KBCycle(CyclicBehaviour):
             await self._reply_failure(msg, conv, code="FAILURE.EXCEPTION", reason=str(e))
 
     async def _handle_get(self, msg: Message, p: Dict[str, Any], conv: Optional[str]):
-        key = p.get("key", "")
-        prefer = p.get("prefer")
-        version = p.get("version")
-        as_of = p.get("as_of")
+        key = self._extract(p, "key", "")
+        prefer = self._extract(p, "prefer", None)
+        version = self._extract(p, "version", None)
+        as_of = self._extract(p, "as_of", None)
 
-        if not KEY_RE.match(key):
+        if not KEY_RE.match(key or ""):
             await self._reply_failure(msg, conv, code="FAILURE.INVALID_KEY",
                                       reason="Key must have 5 segments and allowed chars [a-z0-9._-]")
             return
@@ -300,7 +332,7 @@ class KBCycle(CyclicBehaviour):
             elif isinstance(version, str) and version.isdigit():
                 vnum = int(version)
 
-            value, ver, etag, stored_at = await asyncio.to_thread(
+            content_type, value, ver, etag, stored_at = await asyncio.to_thread(
                 self.agent.storage.get, key, prefer, vnum, as_of
             )
             await self._reply_inform(msg, conv, {
@@ -308,7 +340,7 @@ class KBCycle(CyclicBehaviour):
                 "key": key,
                 "version": ver,
                 "etag": etag,
-                "content_type": "application/json",
+                "content_type": content_type,
                 "value": value,
                 "stored_at": stored_at,
             })
@@ -373,6 +405,92 @@ class KBCycle(CyclicBehaviour):
         if self.agent.log_info:
             print(f"[KB] {now_iso()} {code} conv={conv} from={bare(getattr(msg, 'sender', None))} reason={reason}")
 
+# ====== DF REGISTER + HEARTBEAT ======
+class KBRegisterOnce(OneShotBehaviour):
+    async def run(self):
+        jid_bare = bare(str(self.agent.jid))
+
+        body_reg = {
+            "performative": "REQUEST",
+            "sender": jid_bare,
+            "receiver": "Registry",
+            "ontology": "MAS.Core",
+            "protocol": "fipa-request",
+            "language": "application/json",
+            "timestamp": now_iso(),
+            "conversation_id": f"df-{uuid.uuid4().hex}",
+            "content": {
+                "type": "REGISTER",
+                "profile": {
+                    "jid": jid_bare,
+                    "name": KB_NAME,
+                    "description": KB_DESCRIPTION,
+                    "capabilities": KB_CAPABILITIES,
+                    "version": "1.0.0",
+                    "status": "ready",
+                    "ttl_sec": KB_HEARTBEAT_SEC * 3,
+                }
+            }
+        }
+        msg_reg = Message(to=DF_JID)
+        msg_reg.body = json.dumps(body_reg, ensure_ascii=False)
+        await self.send(msg_reg)
+        if getattr(self.agent, "log_info", True):
+            print(f"[KB] {now_iso()} ->DF REGISTER {DF_JID} name={KB_NAME} caps={KB_CAPABILITIES}")
+
+        body_hb = {
+            "performative": "INFORM",
+            "sender": jid_bare,
+            "receiver": "Registry",
+            "ontology": "MAS.Core",
+            "protocol": "fipa-request",
+            "language": "application/json",
+            "timestamp": now_iso(),
+            "conversation_id": f"df-{uuid.uuid4().hex}",
+            "content": {
+                "type": "HEARTBEAT",
+                "jid": jid_bare,
+                "status": "ready",
+                "name": KB_NAME,
+                "description": KB_DESCRIPTION,
+                "capabilities": KB_CAPABILITIES,
+                "version": "1.0.0"
+            }
+        }
+        msg_hb = Message(to=DF_JID)
+        msg_hb.body = json.dumps(body_hb, ensure_ascii=False)
+        await self.send(msg_hb)
+        if getattr(self.agent, "log_info", True):
+            print(f"[KB] {now_iso()} ->DF HEARTBEAT sent (bootstrap)")
+
+class KBHeartbeat(PeriodicBehaviour):
+    async def run(self):
+        jid_bare = bare(str(self.agent.jid))
+        body = {
+            "performative": "INFORM",
+            "sender": jid_bare,
+            "receiver": "Registry",
+            "ontology": "MAS.Core",
+            "protocol": "fipa-request",
+            "language": "application/json",
+            "timestamp": now_iso(),
+            "conversation_id": f"df-{uuid.uuid4().hex}",
+            "content": {
+                "type": "HEARTBEAT",
+                "jid": jid_bare,
+                "status": "ready",
+                "name": KB_NAME,
+                "description": KB_DESCRIPTION,
+                "capabilities": KB_CAPABILITIES,
+                "version": "1.0.0"
+            }
+        }
+        msg = Message(to=DF_JID)
+        msg.body = json.dumps(body, ensure_ascii=False)
+        await self.send(msg)
+        if getattr(self.agent, "log_info", True):
+            print(f"[KB] {now_iso()} ->DF HEARTBEAT tick")
+
 class KBAgent(Agent):
     def __init__(self, jid: str, password: str, storage: KBStorage, allowed_bare: str, verify_security: bool):
         super().__init__(jid, password, verify_security=verify_security)
@@ -382,17 +500,16 @@ class KBAgent(Agent):
 
     async def setup(self):
         print(f"[KB] Start jako {self.jid}. Allowed={self.allowed_bare} DB={_mask_dsn(KB_DB_DSN)}")
-        self.add_behaviour(KBCycle())
+        self.add_behaviour(KBCycle())                 # obsługa MAS.KB
+        self.add_behaviour(KBRegisterOnce())          # REGISTER + natychmiastowy HB
+        self.add_behaviour(KBHeartbeat(period=KB_HEARTBEAT_SEC))  # cykliczny HB
 
 # ====== MAIN ======
 async def amain():
     if not KB_JID or not KB_PASSWORD:
         raise SystemExit("Brak KB_JID/KB_PASSWORD w środowisku")
 
-    # DB storage
     storage = KBStorage(KB_DB_DSN)
-
-    # verify_security: "1" → True (domyślnie); "0" → False (poluzuj TLS, żeby ruszyć na self-signed)
     verify_flag = (str(KB_VERIFY_SECURITY).strip() != "0")
 
     agent = KBAgent(
