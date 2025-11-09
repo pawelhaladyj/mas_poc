@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Coordinator – USER_MSG -> DF lookup -> AI select -> REQUEST.ASK_EXPERT -> RESULT -> PRESENTER_REPLY
 # Wersja z dyspozytorem i kolejkami per-rozmowa, wybór kandydata przez OpenAI (AIConnector).
+# Obsługuje COORD_DF_MODE: "NEED" (domyślnie) lub "ALL" (pełna pula z DF).
 
 import os
 import json
@@ -27,15 +28,12 @@ from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 # --- AI Connector (ścieżki jak w zrzucie) ---
 from utils.aiconnector import AIConnector  # nazwa z drzewa plików
 
-
 # --- System prompt (opcjonalnie z pliku systemprompt.py) ---
 SELECTOR_SYSTEM_PROMPT: Optional[str] = None
 try:
-    # Jeżeli w repo jest plik systemprompt.py z tekstem promptu
     from systemprompt import SELECTOR_SYSTEM_PROMPT as _SP  # type: ignore
     SELECTOR_SYSTEM_PROMPT = _SP
 except Exception:
-    # Fallback – treść z polecenia
     SELECTOR_SYSTEM_PROMPT = (
         "Jesteś selektorem agentów.\n\n"
         "Wejście:\n"
@@ -90,6 +88,7 @@ except Exception:
     )
 
 # ====== ENV ======
+
 def _env(*names: str, default: Optional[str] = None) -> Optional[str]:
     for n in names:
         v = os.getenv(n)
@@ -101,12 +100,19 @@ AGENT_JID        = _env("COORDINATOR_JID", "AGENT_JID", "XMPP_JID")         # np
 AGENT_PASS       = _env("COORDINATOR_PASS", "AGENT_PASS", "XMPP_PASS")
 REGISTRY_JID     = _env("REGISTRY_JID", "DF_JID", default="registry@xmpp.pawelhaladyj.pl")
 NEED_CAP         = _env("NEED_CAP", default="ASK_EXPERT") or "ASK_EXPERT"
-REQ_TIMEOUT_S    = int(_env("COORD_REQ_TIMEOUT", default="10") or "10")      # czekanie na odpowiedź (s)
-MAX_RETRIES      = int(_env("COORD_MAX_RETRIES", default="2") or "2")        # próby wysłania do specjalisty
+REQ_TIMEOUT_S    = int(_env("COORD_REQ_TIMEOUT", default="10") or "10")      # timeout na odpowiedzi (s)
+MAX_RETRIES      = int(_env("COORD_MAX_RETRIES", default="2") or "2")        # próby do specjalistów
 MAX_CONCURRENCY  = int(_env("COORD_MAX_CONCURRENCY", default="5") or "5")    # maks. rozmów równolegle
-CONV_GRACE_SEC   = float(_env("COORD_CONV_GRACE_SEC", default="0.5") or "0.5")  # krótka karencja przed sprzątaniem
+CONV_GRACE_SEC   = float(_env("COORD_CONV_GRACE_SEC", default="0.5") or "0.5")
+
+# Tryb zapytania do DF – "NEED" (domyślnie) lub "ALL" (pełna pula)
+DF_MODE          = (_env("COORD_DF_MODE", default="NEED") or "NEED").upper()  # "NEED" | "ALL"
+
+# Przełącznik debugowania logów AI
+DEBUG_AI = (_env("COORD_DEBUG_AI", default="1") or "1") == "1"
 
 # ====== ACL helpers ======
+
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -134,6 +140,7 @@ def parse_acl(body: str) -> Dict[str, Any]:
     return json.loads(body)
 
 # ====== AGENT ======
+
 class CoordinatorAgent(Agent):
     def __init__(self, jid: str, password: str, *args, **kwargs):
         super().__init__(jid, password, *args, **kwargs)
@@ -142,7 +149,7 @@ class CoordinatorAgent(Agent):
         # Kontrola współbieżności rozmów
         self.sem = asyncio.Semaphore(MAX_CONCURRENCY)
         self.registry_jid = REGISTRY_JID
-        # Pojedynczy, współdzielony konektor AI (wątki → równoległość)
+        # Pojedynczy, współdzielony konektor AI
         self.ai = AIConnector()
 
     # ---------- Behawiory ----------
@@ -220,50 +227,66 @@ class CoordinatorAgent(Agent):
         # --- Pomocnicze: wysyłka/odbiór *z poziomu behawioru* ---
         async def df_lookup(self) -> List[Any]:
             """
-            Zapytaj DF o kandydatów ASK_EXPERT.
-            Zwraca listę: albo JID-ów (str), albo rozszerzonych profili (dict).
+            Zapytaj DF o kandydatów:
+            - COORD_DF_MODE=NEED → tylko z daną capability (NEED_CAP)
+            - COORD_DF_MODE=ALL  → pełna żywa pula (DF musi rozumieć need="ALL")
+            Zwraca listę: JID-ów (str) lub rozszerzonych profili (dict).
             """
-            reply_id = f"dfq-{int(time.time()*1000)}"
-            msg = Message(to=self.agent.registry_jid)
-            msg.set_metadata("conv", self.conv_id)
-            msg.set_metadata("performative", "QUERY-REF")
-            msg.body = make_acl(
-                "QUERY-REF", "Coordinator", "Registry",
-                content={"need": NEED_CAP},
-                conversation_id=self.conv_id,
-                reply_with=reply_id,
-                protocol="fipa-query",
-            )
-            print(f"[COORD] {now_iso()} → DF {self.agent.registry_jid} QUERY-REF need={NEED_CAP} conv={self.conv_id}")
-            await self.send(msg)
+            async def _query(need_value: str) -> List[Any]:
+                reply_id = f"dfq-{int(time.time()*1000)}"
+                msg = Message(to=self.agent.registry_jid)
+                msg.set_metadata("conv", self.conv_id)
+                msg.set_metadata("performative", "QUERY-REF")
+                msg.body = make_acl(
+                    "QUERY-REF", "Coordinator", "Registry",
+                    content={"need": need_value},
+                    conversation_id=self.conv_id,
+                    reply_with=reply_id,
+                    protocol="fipa-query",
+                )
+                print(f"[COORD] {now_iso()} → DF {self.agent.registry_jid} QUERY-REF need={need_value} conv={self.conv_id}")
+                await self.send(msg)
 
-            q: asyncio.Queue = self.agent.conv_queues[self.conv_id]
-            deadline = time.time() + REQ_TIMEOUT_S
-            while time.time() < deadline:
-                remain = max(0, deadline - time.time())
-                try:
-                    m: Message = await asyncio.wait_for(q.get(), timeout=min(remain, 1.0))
-                except asyncio.TimeoutError:
-                    continue
+                q: asyncio.Queue = self.agent.conv_queues[self.conv_id]
+                deadline = time.time() + REQ_TIMEOUT_S
+                while time.time() < deadline:
+                    remain = max(0, deadline - time.time())
+                    try:
+                        m: Message = await asyncio.wait_for(q.get(), timeout=min(remain, 1.0))
+                    except asyncio.TimeoutError:
+                        continue
 
-                try:
-                    acl = parse_acl(m.body)
-                except Exception as e:
-                    print(f"[COORD] {now_iso()} [DF] odrzucono nie-JSON ({e}) od {m.sender}")
-                    continue
+                    try:
+                        acl = parse_acl(m.body)
+                    except Exception as e:
+                        print(f"[COORD] {now_iso()} [DF] odrzucono nie-JSON ({e}) od {m.sender}")
+                        continue
 
-                if acl.get("conversation_id") != self.conv_id:
-                    continue
+                    if acl.get("conversation_id") != self.conv_id:
+                        continue
 
-                pf = acl.get("performative")
-                if pf == "INFORM":
-                    cont = acl.get("content") or {}
-                    candidates = cont.get("candidates") or []
-                    print(f"[COORD] {now_iso()} ← DF INFORM candidates={candidates} conv={self.conv_id}")
-                    return candidates
+                    if acl.get("performative") == "INFORM":
+                        cont = acl.get("content") or {}
+                        # Preferuj pełne profile; jeśli brak – użyj listy JID-ów.
+                        profiles = cont.get("profiles") or []
+                        candidates = profiles or (cont.get("candidates") or [])
+                        src = "profiles" if profiles else "candidates"
+                        print(f"[COORD] {now_iso()} ← DF INFORM {src} count={len(candidates)} conv={self.conv_id}")
+                        return candidates
 
-            print(f"[COORD] {now_iso()} [DF] timeout po {REQ_TIMEOUT_S}s conv={self.conv_id}")
-            return []
+                print(f"[COORD] {now_iso()} [DF] timeout po {REQ_TIMEOUT_S}s conv={self.conv_id}")
+                return []
+
+            # Główna logika: tryb wg DF_MODE, z bezpiecznym fallbackiem
+            if DF_MODE == "ALL":
+                got = await _query("ALL")
+                if not got:
+                    # Fallback: spróbuj klasycznie po capability
+                    print(f"[COORD] {now_iso()} [DF] ALL→pusto, fallback do NEED={NEED_CAP}")
+                    got = await _query(NEED_CAP)
+                return got
+            else:
+                return await _query(NEED_CAP)
 
         def _normalize_candidates(self, raw_list: List[Any]) -> List[Dict[str, Any]]:
             """
@@ -278,7 +301,7 @@ class CoordinatorAgent(Agent):
                         "jid": item,
                         "name": item,
                         "description": "",
-                        "capabilities": [NEED_CAP],
+                        "capabilities": [NEED_CAP],  # minimalny domysł, by zachować kompatybilność z promptem
                         "skills": [],
                         "status": "online",
                     })
@@ -293,7 +316,6 @@ class CoordinatorAgent(Agent):
                         "status": item.get("status", "online"),
                     })
                 else:
-                    # Nieznany typ – ignorujemy
                     continue
             # Filtr bezpieczeństwa: bez pustych JID
             return [c for c in norm if c.get("jid")]
@@ -333,6 +355,20 @@ class CoordinatorAgent(Agent):
                 "candidates": candidates,
             }
 
+            # DEBUG >>> (łatwo zakomentować poniższy blok)
+            if DEBUG_AI:
+                try:
+                    preview = {
+                        "selector_input": selector_input,
+                        "system_prompt_preview": (SELECTOR_SYSTEM_PROMPT or "")[:240] +
+                            ("..." if (SELECTOR_SYSTEM_PROMPT and len(SELECTOR_SYSTEM_PROMPT) > 240) else "")
+                    }
+                    print(f"[COORD] {now_iso()} [AI][DEBUG] payload → selector:\n"
+                          f"{json.dumps(preview, ensure_ascii=False, indent=2)}")
+                except Exception as e:
+                    print(f"[COORD] {now_iso()} [AI][DEBUG] Błąd podczas logowania payloadu: {e}")
+            # DEBUG <<<
+
             messages = [
                 {"role": "system", "content": SELECTOR_SYSTEM_PROMPT or ""},
                 {"role": "user", "content": json.dumps(selector_input, ensure_ascii=False)},
@@ -351,6 +387,12 @@ class CoordinatorAgent(Agent):
                 return None
 
             txt = (res.get("text") or "").strip()
+
+            # DEBUG >>> surowa odpowiedź AI (też łatwo wyłączyć)
+            if DEBUG_AI:
+                print(f"[COORD] {now_iso()} [AI][DEBUG] raw response: {txt!r}")
+            # DEBUG <<<
+
             try:
                 data = json.loads(txt) if txt else {}
             except Exception as e:
@@ -460,13 +502,13 @@ class CoordinatorAgent(Agent):
 
                     # Fallback deterministyczny (bez AI lub błąd AI)
                     if not selected_jid:
-                        # filtr: dostępny + ma wymaganą capability
+                        # Gdy DF_MODE=NEED, preferuj tych z capability; gdy ALL – najpierw ci z capability, potem reszta
                         avail = [
                             c for c in candidates
                             if str(c.get("status", "")).lower() in ("online", "available", "ready")
-                            and (NEED_CAP in (c.get("capabilities") or []))
                         ]
-                        prefer = avail if avail else candidates
+                        with_cap = [c for c in avail if NEED_CAP in (c.get("capabilities") or [])]
+                        prefer = with_cap if with_cap else (avail if avail else candidates)
                         selected_jid = sorted([c["jid"] for c in prefer])[0]
                         print(f"[COORD] {now_iso()} [FALLBACK] Wybrano deterministycznie: {selected_jid}")
 
@@ -507,10 +549,11 @@ class CoordinatorAgent(Agent):
     async def setup(self):
         print(f"[COORD] Start jako {self.jid}. DF={self.registry_jid} "
               f"NEED={NEED_CAP} TIMEOUT={REQ_TIMEOUT_S}s RETRIES={MAX_RETRIES} "
-              f"CONCURRENCY={MAX_CONCURRENCY}")
+              f"CONCURRENCY={MAX_CONCURRENCY} DF_MODE={DF_MODE}")
         self.add_behaviour(self.Dispatcher())
 
 # ====== MAIN ======
+
 async def main():
     if not AGENT_JID or not AGENT_PASS:
         raise RuntimeError("Brak COORDINATOR_JID/COORDINATOR_PASS (lub XMPP_JID/XMPP_PASS) w środowisku.")

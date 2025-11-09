@@ -42,7 +42,7 @@ Wyjście: AGREE, następnie INFORM { type: "RESULT", result: { answer: <str>, me
 Rejestracja i heartbeat do DF automatycznie.
 """
 
-# ====== ENV helpers ======
+# ====== helpers ======
 def _first_env(*names: str, default: str | None = None) -> str | None:
     for n in names:
         v = os.getenv(n)
@@ -51,11 +51,9 @@ def _first_env(*names: str, default: str | None = None) -> str | None:
     return default
 
 def _env_text(name: str) -> str | None:
-    """Pobiera tekst z ENV; NIE psuje UTF-8. Opcjonalnie rozwija \\n, \\t i \\uXXXX gdy faktycznie występują."""
     v = os.getenv(name)
     if not v:
         return None
-    # Jeśli ktoś faktycznie wstawił sekwencje ucieczki, rozwiń je bez ruszania zwykłych polskich znaków.
     if "\\u" in v or "\\n" in v or "\\t" in v:
         try:
             import codecs
@@ -63,7 +61,6 @@ def _env_text(name: str) -> str | None:
         except Exception:
             v = v.replace("\\n", "\n").replace("\\t", "\t")
     return v
-
 
 def _load_description(fallback_code_text: str) -> str:
     path = _first_env("SPEC_DESC_PATH", "SPECIALIST_DESC_PATH")
@@ -90,8 +87,11 @@ def _load_description(fallback_code_text: str) -> str:
 
     return _first_env("SPEC_DESC_SHORT", default="POC specialist (ASK_EXPERT)") or "POC specialist (ASK_EXPERT)"
 
+def _bare(j: str | None) -> str:
+    return (j or "").split("/")[0]
+
 # ====== ENV (identyfikacja i parametry) ======
-AGENT_JID    = _first_env("SPECIALIST_JID", "AGENT_JID", "XMPP_JID")  # specialist@xmpp.pawelhaladyj.pl
+AGENT_JID    = _first_env("SPECIALIST_JID", "AGENT_JID", "XMPP_JID")  # np. specialist@xmpp.pawelhaladyj.pl
 AGENT_PASS   = _first_env("SPECIALIST_PASS", "AGENT_PASS", "XMPP_PASS")
 REGISTRY_JID = _first_env("REGISTRY_JID", "DF_JID", default="registry@xmpp.pawelhaladyj.pl")
 
@@ -131,23 +131,25 @@ def make_acl(
     })
 
 def parse_acl(body: str) -> Dict[str, Any]:
-    return json.loads(body)
+    return json.loads(body or "{}")
 
 # ====== AGENT ======
 class SpecialistAgent(Agent):
 
     class RegisterBehaviour(OneShotBehaviour):
         async def run(self):
-            # wysyłamy REGISTER do DF po starcie agenta (zachowanie ma dostęp do self.send)
             conv_id = f"sess-{int(time.time())}"
             reply_id = f"msg-{int(time.time()*1000)}"
+            jid_bare = _bare(str(self.agent.jid))
+
+            # REGISTER
             reg = Message(to=self.agent.registry_jid)
             reg.body = make_acl(
-                "REQUEST", NAME, "Registry",
+                "REQUEST", jid_bare, "Registry",
                 content={
                     "type": "REGISTER",
                     "profile": {
-                        "jid": str(self.agent.jid),
+                        "jid": jid_bare,
                         "name": NAME,
                         "version": VERSION,
                         "capabilities": [CAP],
@@ -158,7 +160,16 @@ class SpecialistAgent(Agent):
                 reply_with=reply_id,
             )
             await self.send(reg)
-            print(f"[SPEC] REGISTER sent to {self.agent.registry_jid} as {self.agent.jid}")
+
+            # NATYCHMIASTOWY HEARTBEAT (żeby od razu być „alive” w DF)
+            hb = Message(to=self.agent.registry_jid)
+            hb.body = make_acl(
+                "INFORM", jid_bare, "Registry",
+                content={"type": "HEARTBEAT", "jid": jid_bare, "status": "ready"}
+            )
+            await self.send(hb)
+
+            print(f"[SPEC] REGISTER+HB sent to {self.agent.registry_jid} as {jid_bare}")
             print(f"[SPEC] HB={HEARTBEAT_S}s, cap={CAP}, name={NAME}, version={VERSION}")
             print(f"[SPEC] Description (first 120 chars): {DESC[:120].replace(os.linesep, ' ')}{'...' if len(DESC) > 120 else ''}")
 
@@ -172,8 +183,8 @@ class SpecialistAgent(Agent):
             except Exception:
                 return
 
-            pf  = acl.get("performative")
-            c   = acl.get("content", {}) or {}
+            pf  = (acl.get("performative") or "").upper()
+            c   = (acl.get("content") or {}) or {}
             typ = (c.get("type") or "").upper()
 
             if pf == "REQUEST" and typ == "ASK_EXPERT":
@@ -210,16 +221,16 @@ class SpecialistAgent(Agent):
 
     class HeartbeatBehaviour(PeriodicBehaviour):
         async def run(self):
+            jid_bare = _bare(str(self.agent.jid))
             hb = Message(to=self.agent.registry_jid)
             hb.body = make_acl(
-                "INFORM", NAME, "Registry",
-                content={"type": "HEARTBEAT", "jid": str(self.agent.jid)}
+                "INFORM", jid_bare, "Registry",
+                content={"type": "HEARTBEAT", "jid": jid_bare, "status": "ready"}
             )
             await self.send(hb)
 
     async def setup(self):
         self.registry_jid = REGISTRY_JID
-        # Rejestracja, obsługa i heartbeat jako zachowania
         self.add_behaviour(self.RegisterBehaviour())
         self.add_behaviour(self.ServeBehaviour())
         self.add_behaviour(self.HeartbeatBehaviour(period=HEARTBEAT_S))
