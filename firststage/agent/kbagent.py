@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-# KB-Agent — prosty agent wiedzy (append-only) dla MAS
-# SPADE + PostgreSQL (psycopg2). Rejestracja w DF (REQUEST REGISTER) + cykliczny HEARTBEAT.
-# Operacje KB (STORE/GET) dostępne wyłącznie dla Koordynatora (whitelist JID).
+# KB-Agent — append-only KB dla MAS (STORE/GET), zgodny z Koordynatorem:
+# - klucze typu: session:{conv_id}:chat:frame:{ts_ms}
+#                session:{conv_id}:chat:timeline:main
+# - if_match: "vN" lub ETag (uuid)
+# - odpowiedzi: INFORM {type: STORED|VALUE, key, version, etag, content_type, value, stored_at}
 
 import os
 import re
@@ -23,7 +25,6 @@ except Exception as e:
     print(f"[KB] Uwaga: problem z dotenv: {e} (kontynuuję).")
 
 from spade.agent import Agent
-    # ^^^ SPADE
 from spade.message import Message
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour, PeriodicBehaviour
 
@@ -58,7 +59,6 @@ _DEFAULT_KB_DESCRIPTION = (
 )
 KB_DESCRIPTION = _getenv("KB_DESCRIPTION", _DEFAULT_KB_DESCRIPTION)
 
-# Twardy fallback na capability, także gdy w .env jest pusta wartość
 _cap_raw = _getenv("KB_CAPABILITIES")
 if not _cap_raw or not _cap_raw.strip():
     _cap_raw = "KB.STORE,KB.GET"
@@ -187,7 +187,10 @@ class KBStorage:
         prefer: Optional[str] = None,
         version: Optional[int] = None,
         as_of: Optional[str] = None,
-    ) -> Tuple[Dict[str, Any], int, str, str]:
+    ) -> Tuple[str, Dict[str, Any], int, str, str]:
+        """
+        Zwraca: content_type, value, version, etag, stored_at_iso
+        """
         conn = self.pool.getconn()
         try:
             with conn.cursor() as cur:
@@ -220,7 +223,7 @@ class KBStorage:
                 if not row:
                     raise NotFoundError("No value for key")
                 content_type, value, ver, etag, created_at = row
-                return value, int(ver), etag, created_at.isoformat()
+                return str(content_type), value, int(ver), etag, created_at.isoformat()
         finally:
             self.pool.putconn(conn)
 
@@ -241,7 +244,6 @@ class KBCycle(CyclicBehaviour):
         try:
             payload = json.loads(msg.body or "{}")
         except Exception:
-            # Nie odpowiadamy — to nie są nasze ramki
             return
 
         sender_bare = (bare(getattr(msg, "sender", None)) or "").lower()
@@ -254,7 +256,7 @@ class KBCycle(CyclicBehaviour):
             return
 
         conv = payload.get("conversation_id") or payload.get("conversationId")
-        mtype = payload.get("type")
+        mtype = payload.get("type") or (payload.get("content") or {}).get("type")
 
         # Whitelist — tylko Koordynator
         if sender_bare != self.agent.allowed_bare:
@@ -268,20 +270,26 @@ class KBCycle(CyclicBehaviour):
         else:
             await self._reply_refuse(msg, conv, code="REFUSE.UNSUPPORTED_TYPE", reason=str(mtype))
 
-    async def _handle_store(self, msg: Message, p: Dict[str, Any], conv: Optional[str]):
-        key = p.get("key", "")
-        content_type = p.get("content_type", "application/json")
-        value = p.get("value")
-        tags = p.get("tags") or []
-        if_match = p.get("if_match")
+    def _extract(self, p: Dict[str, Any], name: str, default=None):
+        # pozwala na oba style: top-level i content.{...}
+        if name in p:
+            return p.get(name, default)
+        return (p.get("content") or {}).get(name, default)
 
-        if not KEY_RE.match(key):
+    async def _handle_store(self, msg: Message, p: Dict[str, Any], conv: Optional[str]):
+        key = self._extract(p, "key", "")
+        content_type = self._extract(p, "content_type", "application/json")
+        value = self._extract(p, "value", None)
+        tags = self._extract(p, "tags", []) or []
+        if_match = self._extract(p, "if_match", None)
+
+        if not KEY_RE.match(key or ""):
             await self._reply_failure(msg, conv, code="FAILURE.INVALID_KEY",
                                       reason="Key must have 5 segments and allowed chars [a-z0-9._-]")
             return
 
         session_id = None
-        parts = key.split(":", 4)
+        parts = (key or "").split(":", 4)
         if len(parts) >= 2 and parts[0] == "session":
             session_id = parts[1]
 
@@ -289,7 +297,7 @@ class KBCycle(CyclicBehaviour):
             version, etag, stored_at = await asyncio.to_thread(
                 self.agent.storage.store,
                 key, content_type, value, tags, session_id,
-                created_by=self.agent.allowed_bare,
+                created_by=(bare(getattr(msg, "sender", None)) or self.agent.allowed_bare),
                 if_match=if_match,
             )
             await self._reply_inform(msg, conv, {
@@ -307,12 +315,12 @@ class KBCycle(CyclicBehaviour):
             await self._reply_failure(msg, conv, code="FAILURE.EXCEPTION", reason=str(e))
 
     async def _handle_get(self, msg: Message, p: Dict[str, Any], conv: Optional[str]):
-        key = p.get("key", "")
-        prefer = p.get("prefer")
-        version = p.get("version")
-        as_of = p.get("as_of")
+        key = self._extract(p, "key", "")
+        prefer = self._extract(p, "prefer", None)
+        version = self._extract(p, "version", None)
+        as_of = self._extract(p, "as_of", None)
 
-        if not KEY_RE.match(key):
+        if not KEY_RE.match(key or ""):
             await self._reply_failure(msg, conv, code="FAILURE.INVALID_KEY",
                                       reason="Key must have 5 segments and allowed chars [a-z0-9._-]")
             return
@@ -324,7 +332,7 @@ class KBCycle(CyclicBehaviour):
             elif isinstance(version, str) and version.isdigit():
                 vnum = int(version)
 
-            value, ver, etag, stored_at = await asyncio.to_thread(
+            content_type, value, ver, etag, stored_at = await asyncio.to_thread(
                 self.agent.storage.get, key, prefer, vnum, as_of
             )
             await self._reply_inform(msg, conv, {
@@ -332,7 +340,7 @@ class KBCycle(CyclicBehaviour):
                 "key": key,
                 "version": ver,
                 "etag": etag,
-                "content_type": "application/json",
+                "content_type": content_type,
                 "value": value,
                 "stored_at": stored_at,
             })
@@ -404,7 +412,7 @@ class KBRegisterOnce(OneShotBehaviour):
 
         body_reg = {
             "performative": "REQUEST",
-            "sender": jid_bare,  # kluczowe: bare JID
+            "sender": jid_bare,
             "receiver": "Registry",
             "ontology": "MAS.Core",
             "protocol": "fipa-request",
@@ -430,7 +438,6 @@ class KBRegisterOnce(OneShotBehaviour):
         if getattr(self.agent, "log_info", True):
             print(f"[KB] {now_iso()} ->DF REGISTER {DF_JID} name={KB_NAME} caps={KB_CAPABILITIES}")
 
-        # Jednorazowy HEARTBEAT od razu po REGISTER (z metadanymi)
         body_hb = {
             "performative": "INFORM",
             "sender": jid_bare,
@@ -461,7 +468,7 @@ class KBHeartbeat(PeriodicBehaviour):
         jid_bare = bare(str(self.agent.jid))
         body = {
             "performative": "INFORM",
-            "sender": jid_bare,  # kluczowe: bare JID
+            "sender": jid_bare,
             "receiver": "Registry",
             "ontology": "MAS.Core",
             "protocol": "fipa-request",
@@ -472,7 +479,6 @@ class KBHeartbeat(PeriodicBehaviour):
                 "type": "HEARTBEAT",
                 "jid": jid_bare,
                 "status": "ready",
-                # Dołączamy metadane także w HB, by DF mógł je uzupełnić nawet bez REGISTER
                 "name": KB_NAME,
                 "description": KB_DESCRIPTION,
                 "capabilities": KB_CAPABILITIES,
