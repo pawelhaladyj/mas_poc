@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 # Presenter – wejście/wyjście człowieka (USER_MSG -> PRESENTER_REPLY)
 # Po staremu: SPADE, JSON-ACL, solidne logi, brak wyścigów.
-# ZMIANY: stałe conversation_id per sesja Presentera (self.session_id) + lock na sesję.
-#         Usunięto podwójne ładowanie dotenv; czytelniejszy komunikat przy timeoucie.
+# ZMIANY (2025-11-10):
+# - Stałe conversation_id per sesja (self.session_id) + lock na sesję
+# - KORELACJA (punkt 8): CorrBook + allow_if_correlated
+# - Rejestr oczekiwań na INFORM.PRESENTER_REPLY od Koordynatora (in_reply_to = reply_with)
 
 import os
 import json
@@ -43,32 +45,18 @@ CONV_ID_ONESHOT  = _env("PRESENTER_CONV_ID", "CONV_ID", default=None)
 # Możliwość narzucenia ID sesji z ENV (np. frontend)
 SESSION_ID_ENV   = _env("PRESENTER_SESSION_ID", "PRESENTER_CONV_ID", "CONV_ID", default=None)
 
-# ====== ACL helpers ======
-def now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-def make_acl(
-    performative: str, sender: str, receiver: str, content: Dict[str, Any],
-    conversation_id: Optional[str] = None, reply_with: Optional[str] = None,
-    in_reply_to: Optional[str] = None, protocol: Optional[str] = None
-) -> str:
-    prot = protocol or ("fipa-query" if performative == "QUERY-REF" else "fipa-request")
-    return json.dumps({
-        "performative": performative,
-        "sender": sender,
-        "receiver": receiver,
-        "ontology": "MAS.Core",
-        "protocol": prot,
-        "language": "application/json",
-        "timestamp": now_iso(),
-        "conversation_id": conversation_id,
-        "reply_with": reply_with,
-        "in_reply_to": in_reply_to,
-        "content": content,
-    })
+# ====== PROTOKOŁ (wzorcówka) ======
+from firststage.protocol.acl_messages import (
+    AclMessage, make_acl, new_reply_id, now_iso
+)
+from firststage.protocol.correlation import CorrBook
+from firststage.protocol.guards import allow_if_correlated, bare as bare_jid
 
 def parse_acl(body: str) -> Dict[str, Any]:
-    return json.loads(body)
+    try:
+        return AclMessage.loads(body).model_dump()
+    except Exception:
+        return json.loads(body or "{}")
 
 # ====== AGENT ======
 class PresenterAgent(Agent):
@@ -76,6 +64,8 @@ class PresenterAgent(Agent):
     REQ:  REQUEST.USER_MSG -> to Coordinator
     RSP:  INFORM.PRESENTER_REPLY <- from Coordinator
     Jedna SESJA agenta = JEDNO stałe conversation_id (self.session_id).
+    Korelacja: odpowiedzi muszą mieć in_reply_to == reply_with z naszej wysyłki
+               i pochodzić od bare(COORD_JID).
     """
 
     def __init__(self, jid: str, password: str, *args, **kwargs):
@@ -83,17 +73,18 @@ class PresenterAgent(Agent):
         self.conv_queues: Dict[str, asyncio.Queue] = {}
         self.sem = asyncio.Semaphore(MAX_CONCURRENCY)
         self.coordinator_jid = COORD_JID
-        # Lock na sesję, by nie mieszać ramek przy wspólnym conversation_id
         self.session_lock = asyncio.Lock()
+        self.corr = CorrBook(ttl_sec=REQ_TIMEOUT_S + 2.0)  # księga korelacji
         # self.session_id ustawimy w setup()
 
     # ---------- Behawiory ----------
     class Dispatcher(CyclicBehaviour):
-        """Globalny odbiornik: kieruje każdą ramkę do kolejki wg conversation_id."""
+        """Globalny odbiornik: filtruje i kieruje ramki wg conversation_id z korelacją (punkt 8)."""
         async def run(self):
             msg = await self.receive(timeout=1)
             if not msg:
                 return
+
             try:
                 acl = parse_acl(msg.body)
             except Exception as e:
@@ -109,11 +100,17 @@ class PresenterAgent(Agent):
                 print(f"[PRES] {now_iso()} Ignoruję ramkę bez conversation_id pf={pf} typ={typ} od {msg.sender}")
                 return
 
+            # Strażnik korelacji: przyjmujemy tylko to, na co czekamy (od Koordynatora, po in_reply_to)
+            from_bare = bare_jid(str(msg.sender))
+            if not allow_if_correlated(self.agent.corr, acl, from_bare=from_bare):
+                print(f"[PRES] {now_iso()} DROP pf={pf} from={from_bare} conv={conv} irt={acl.get('in_reply_to')}")
+                return
+
             q = self.agent.conv_queues.get(conv)
             if q:
                 await q.put(msg)
             else:
-                # Spóźnione ramki po domknięciu rozmowy – ciche pominięcie
+                # Spóźnione ramki po domknięciu rozmowy – pomiń po cichu
                 pass
 
     class ServeConversation(OneShotBehaviour):
@@ -123,7 +120,9 @@ class PresenterAgent(Agent):
             self.question = question
             self.conv_id = conv_id
 
-        async def send_user_msg(self):
+        async def send_user_msg(self) -> str:
+            # reply_with do korelacji
+            reply_id = new_reply_id("msg")
             msg = Message(to=self.agent.coordinator_jid)
             msg.set_metadata("conv", self.conv_id)
             msg.set_metadata("performative", "REQUEST")
@@ -135,11 +134,21 @@ class PresenterAgent(Agent):
                     "meta": {"presenter_jid": str(self.agent.jid)}
                 },
                 conversation_id=self.conv_id,
-                reply_with=f"msg-{int(time.time()*1000)}",
+                reply_with=reply_id,
                 protocol="fipa-request",
             )
+
+            # Zarejestruj oczekiwanie: INFORM (preferowane) + dopuszczalnie REFUSE/FAILURE/NOT-UNDERSTOOD
+            self.agent.corr.register(
+                self.conv_id, reply_id,
+                allow_from=[bare_jid(self.agent.coordinator_jid)],
+                allow_pf=["INFORM", "REFUSE", "FAILURE", "NOT-UNDERSTOOD"],
+                note="PRES REQUEST.USER_MSG → oczekuję INFORM.PRESENTER_REPLY"
+            )
+
             print(f"[PRES] {now_iso()} → COORD {self.agent.coordinator_jid} REQUEST.USER_MSG conv={self.conv_id} q={self.question!r}")
             await self.send(msg)
+            return reply_id
 
         async def wait_for_reply(self) -> Optional[str]:
             q: asyncio.Queue = self.agent.conv_queues[self.conv_id]
@@ -169,9 +178,14 @@ class PresenterAgent(Agent):
                     print(f"[PRES] {now_iso()} ← COORD INFORM.PRESENTER_REPLY conv={self.conv_id} text={text!r}")
                     return text
 
-                print(f"[PRES] {now_iso()} [CONV {self.conv_id}] niespodziewane pf={pf} typ={typ}")
+                # Inne dopuszczalne PF – pokaż ślad dla operatora
+                if pf in ("REFUSE", "FAILURE", "NOT-UNDERSTOOD"):
+                    print(f"[PRES] {now_iso()} [CONV {self.conv_id}] pf={pf} typ={typ} payload={json.dumps(cont, ensure_ascii=False)}")
+                    # czekamy dalej do timeoutu, bo niektóre implementacje wyślą jeszcze INFORM
 
-            # Czytelniejszy komunikat dla operatora
+                else:
+                    print(f"[PRES] {now_iso()} [CONV {self.conv_id}] niespodziewane pf={pf} typ={typ}")
+
             print(f"[PRES] {now_iso()} [CONV {self.conv_id}] timeout po {REQ_TIMEOUT_S}s – brak PRESENTER_REPLY. "
                   f"Sugestia: sprawdź czy Koordynator działa i ma poprawny JID ({self.agent.coordinator_jid}).")
             return None
@@ -221,13 +235,11 @@ async def repl_loop(agent: PresenterAgent):
             continue
         if question in ("/q", "/quit", "/exit"):
             break
-        # STAŁE ID SESJI zamiast nowego ID co pytanie
-        conv_id = agent.session_id
+        conv_id = agent.session_id  # stałe ID sesji
         agent.add_behaviour(PresenterAgent.ServeConversation(question, conv_id))
         await asyncio.sleep(0.05)
 
 async def oneshot(agent: PresenterAgent, question: str, conv_id: Optional[str]):
-    # Jeśli nie podasz CONV_ID_ONESHOT, użyj ID sesji agenta
     conv = conv_id or agent.session_id
     agent.add_behaviour(PresenterAgent.ServeConversation(question, conv))
     while agent.is_alive():

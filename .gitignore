@@ -11,3 +11,5 @@ temp_note.txt
 smoketest/
 notes/
 
+#cache
+__pycache__/

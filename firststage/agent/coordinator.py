@@ -7,6 +7,8 @@
 # - Retry/backoff (exponential + jitter) dla GET/STORE wobec KB
 # - Automatyczny read-modify-write przy FAILURE.CONFLICT na timeline (if_match)
 # - Telemetria KB: czasy i liczniki (best-effort, z adapterem metryk)
+# - [PUNKT 8] Spójność sesji + korelacja: CorrBook + allow_if_correlated
+# - [PUNKT 8] Rejestr oczekiwań pod DF (QUERY-REF→INFORM) i Specjalistę (REQUEST→AGREE/INFORM)
 
 import os
 import json
@@ -34,6 +36,11 @@ from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 # --- AI Connector ---
 from firststage.utils.aiconnector import AIConnector  # ścieżka zgodna z drzewem projektu
 
+# --- PROTOKOŁ i KORELACJA (punkt 8) ---
+from firststage.protocol.acl_messages import AclMessage, make_acl, new_reply_id, now_iso  # wzorcowe DTO/FIPA
+from firststage.protocol.correlation import CorrBook
+from firststage.protocol.guards import allow_if_correlated, bare as bare_jid
+
 # --- Metryki (best-effort adapter wspólnego modułu) ---
 class _NoopMetrics:
     enabled = False
@@ -50,9 +57,7 @@ def _load_kb_metrics():
     try:
         from firststage.kb.metrics import KBMetrics  # type: ignore
         m = KBMetrics()
-        # minimalny sanity check
-        _ = getattr(m, "store_ok_ms")
-        _ = getattr(m, "get_ok_ms")
+        _ = getattr(m, "store_ok_ms"); _ = getattr(m, "get_ok_ms")
         return m
     except Exception:
         return _NoopMetrics()
@@ -96,58 +101,32 @@ DEBUG_AI         = (_env("COORD_DEBUG_AI", default="1") or "1") == "1"
 KB_JID           = _env("KB_JID", default="kb@xmpp.pawelhaladyj.pl")
 HISTORY_LEN      = int(_env("COORD_HISTORY_LEN", default="10") or "10")
 KB_TIMEOUT_S     = int(_env("COORD_KB_TIMEOUT", default="5") or "5")
-KB_LOG_VERBOSE   = (_env("COORD_KB_LOG", default="1") or "1") == "1"  # dodatkowe logi KB
+KB_LOG_VERBOSE   = (_env("COORD_KB_LOG", default="1") or "1") == "1"
 
 # --- Retry/backoff dla KB ---
-KB_MAX_TRIES     = int(_env("COORD_KB_MAX_TRIES", default="3") or "3")          # ile prób GET/STORE
-KB_BACKOFF_BASE  = float(_env("COORD_KB_BACKOFF_BASE", default="0.2") or "0.2") # sekundy (expo)
-KB_BACKOFF_MAX   = float(_env("COORD_KB_BACKOFF_MAX", default="1.2") or "1.2")  # sekundy (limit)
+KB_MAX_TRIES     = int(_env("COORD_KB_MAX_TRIES", default="3") or "3")
+KB_BACKOFF_BASE  = float(_env("COORD_KB_BACKOFF_BASE", default="0.2") or "0.2")
+KB_BACKOFF_MAX   = float(_env("COORD_KB_BACKOFF_MAX", default="1.2") or "1.2")
 
 # ====== helpers ======
-def now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
 def now_ms() -> int:
     return int(time.time() * 1000)
-
-def bare(j: Any) -> str:
-    try:
-        return str(j).split("/")[0]
-    except Exception:
-        return str(j or "")
 
 def _short(txt: str, n: int = 80) -> str:
     t = (txt or "").replace("\n", " ").strip()
     return t if len(t) <= n else (t[:n] + "…")
 
 def _exp_backoff_sleep(attempt: int) -> float:
-    # decorrelated jitter: base * 2^(n-1) + U(0, base/2), z limitem
     expo = KB_BACKOFF_BASE * (2 ** max(0, attempt - 1))
     jitter = random.uniform(0.0, KB_BACKOFF_BASE * 0.5)
     return min(KB_BACKOFF_MAX, expo + jitter)
 
-def make_acl(
-    performative: str, sender: str, receiver: str, content: Dict[str, Any],
-    conversation_id: Optional[str] = None, reply_with: Optional[str] = None,
-    in_reply_to: Optional[str] = None, protocol: Optional[str] = None
-) -> str:
-    prot = protocol or ("fipa-query" if performative == "QUERY-REF" else "fipa-request")
-    return json.dumps({
-        "performative": performative,
-        "sender": sender,
-        "receiver": receiver,
-        "ontology": "MAS.Core",
-        "protocol": prot,
-        "language": "application/json",
-        "timestamp": now_iso(),
-        "conversation_id": conversation_id,
-        "reply_with": reply_with,
-        "in_reply_to": in_reply_to,
-        "content": content,
-    })
-
-def parse_acl(body: str) -> Dict[str, Any]:
-    return json.loads(body)
+def parse_acl_to_dict(body: str) -> Dict[str, Any]:
+    """Ujednolicone parsowanie do dict (z AclMessage)."""
+    try:
+        return AclMessage.loads(body).model_dump()
+    except Exception:
+        return json.loads(body or "{}")
 
 def _history_text_from_acl(acl: Dict[str, Any]) -> str:
     c = (acl.get("content") or {})
@@ -173,6 +152,8 @@ class CoordinatorAgent(Agent):
         self.kb_timeout = KB_TIMEOUT_S
         self.kb_log = KB_LOG_VERBOSE
         self.ai = AIConnector()
+        # korelacja (punkt 8)
+        self.corr = CorrBook(ttl_sec=REQ_TIMEOUT_S + 2.0)
         # liczniki (lokalne)
         self.kb_store_ok = 0
         self.kb_store_conflict = 0
@@ -186,24 +167,32 @@ class CoordinatorAgent(Agent):
             if not msg:
                 return
 
+            # KB ma osobne conv_id – przekaż bez strażnika
             try:
-                acl = parse_acl(msg.body)
+                acl_raw = parse_acl_to_dict(msg.body)
             except Exception as e:
                 print(f"[COORD] {now_iso()} Odrzucono nie-JSON od {msg.sender}: {e}")
                 return
 
-            pf   = acl.get("performative")
-            cont = acl.get("content") or {}
-            typ  = (cont.get("type") or "").upper()
-            conv = acl.get("conversation_id")
-
-            # Przekieruj odpowiedzi KB do właściwych kolejek (oddzielne conv_id)
+            conv = acl_raw.get("conversation_id") or ""
             if conv and any(tag in conv for tag in ("-kbget-", "-kbput-", "-kbframe")):
                 q = self.agent.conv_queues.get(conv)
                 if q:
                     await q.put(msg)
                 return
 
+            # Strażnik korelacji (punkt 8)
+            from_bare = bare_jid(str(msg.sender))
+            if not allow_if_correlated(self.agent.corr, acl_raw, from_bare=from_bare):
+                print(f"[COORD] {now_iso()} DROP pf={acl_raw.get('performative')} from={from_bare} "
+                      f"conv={conv} irt={acl_raw.get('in_reply_to')}")
+                return
+
+            pf   = acl_raw.get("performative")
+            cont = acl_raw.get("content") or {}
+            typ  = (cont.get("type") or "").upper()
+
+            # Inicjalizacja rozmowy (USER_MSG)
             if pf == "REQUEST" and typ == "USER_MSG":
                 if not conv:
                     conv = f"sess-{now_ms()}"
@@ -212,7 +201,7 @@ class CoordinatorAgent(Agent):
                 if conv not in self.agent.conv_queues:
                     self.agent.conv_queues[conv] = asyncio.Queue()
 
-                    presenter_jid = (cont.get("meta") or {}).get("presenter_jid") or bare(msg.sender)
+                    presenter_jid = (cont.get("meta") or {}).get("presenter_jid") or from_bare
                     question = (cont.get("args") or {}).get("question") or ""
 
                     self.agent.add_behaviour(
@@ -220,7 +209,7 @@ class CoordinatorAgent(Agent):
                             presenter_jid=presenter_jid,
                             question=question,
                             conv_id=conv,
-                            orig_acl=acl,
+                            orig_acl=acl_raw,
                         )
                     )
                     print(f"[COORD] {now_iso()} ← USER_MSG od {presenter_jid} conv={conv} q={question!r}")
@@ -278,16 +267,13 @@ class CoordinatorAgent(Agent):
             return None
 
         async def _kb_store_frame_ack(self, frame: Dict[str, Any]) -> bool:
-            """
-            STORE (frame) z oczekiwaniem na INFORM {type: STORED}.
-            Klucz unikalny -> konflikt mało prawdopodobny; retry/backoff przy timeoutach.
-            """
             key = f"session:{self.conv_id}:chat:frame:{now_ms()}"
             payload = {
                 "key": key,
                 "content_type": "application/json",
                 "value": frame,
-                "tags": [f"conv:{self.conv_id}", f"type:{(frame.get('type','') or '').lower()}", f"from:{(frame.get('agent','') or '').lower()}"],
+                "tags": [f"conv:{self.conv_id}", f"type:{(frame.get('type','') or '').lower()}",
+                         f"from:{(frame.get('agent','') or '').lower()}"],
             }
             attempt = 0
             while attempt < KB_MAX_TRIES:
@@ -300,12 +286,16 @@ class CoordinatorAgent(Agent):
                 try:
                     msg = Message(to=self.agent.kb_jid); msg.body = json.dumps(body, ensure_ascii=False)
                     await self.send(msg)
-                    acl = await self._kb_wait_for(kb_conv, want_types=["STORED", "FAILURE.CONFLICT", "FAILURE.EXCEPTION"], timeout=self.agent.kb_timeout)
+                    acl = await self._kb_wait_for(
+                        kb_conv,
+                        want_types=["STORED", "FAILURE.CONFLICT", "FAILURE.EXCEPTION"],
+                        timeout=self.agent.kb_timeout
+                    )
                 finally:
                     self.agent.conv_queues.pop(kb_conv, None)
                 if not acl:
                     self.agent.kb_store_timeout += 1
-                    kb_metrics.store_exc()  # timeout traktujemy jak błąd po stronie operacji
+                    kb_metrics.store_exc()
                     if self.agent.kb_log:
                         print(f"[COORD][KB] {now_iso()} !! timeout STORE(frame) conv={self.conv_id}")
                     await asyncio.sleep(_exp_backoff_sleep(attempt))
@@ -327,7 +317,6 @@ class CoordinatorAgent(Agent):
                     payload["key"] = key
                     await asyncio.sleep(_exp_backoff_sleep(attempt))
                     continue
-                # FAILURE.EXCEPTION lub inne
                 kb_metrics.store_exc()
                 if self.agent.kb_log:
                     print(f"[COORD][KB] {now_iso()} FAILURE na STORE(frame): {acl}")
@@ -335,7 +324,6 @@ class CoordinatorAgent(Agent):
             return False
 
         async def _kb_get_timeline_once(self) -> Tuple[List[Dict[str, Any]], Optional[int], bool]:
-            """Pojedyncza próba GET timeline. Zwraca (entries, version, success_flag)."""
             kb_conv = f"{self.conv_id}-kbget-{now_ms()}"
             key = f"session:{self.conv_id}:chat:timeline:main"
             if self.agent.kb_log:
@@ -380,7 +368,6 @@ class CoordinatorAgent(Agent):
             return [], None, False
 
         async def _kb_get_timeline(self) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-            """GET timeline z retry/backoff."""
             attempt = 0
             while attempt < KB_MAX_TRIES:
                 attempt += 1
@@ -391,9 +378,6 @@ class CoordinatorAgent(Agent):
             return [], None
 
         async def _kb_put_timeline_rw(self, entries: List[Dict[str, Any]], if_match_version: Optional[int]) -> bool:
-            """
-            STORE timeline z oczekiwaniem na ACK (STORED) i read-modify-write przy CONFLICT.
-            """
             key = f"session:{self.conv_id}:chat:timeline:main"
             attempt = 0
             current_entries = entries
@@ -452,7 +436,6 @@ class CoordinatorAgent(Agent):
                     await asyncio.sleep(_exp_backoff_sleep(attempt))
                     continue
 
-                # FAILURE.EXCEPTION lub inne – przerwij
                 kb_metrics.store_exc()
                 if self.agent.kb_log:
                     print(f"[COORD][KB] {now_iso()} FAILURE STORE(timeline): {acl}")
@@ -461,9 +444,6 @@ class CoordinatorAgent(Agent):
             return False
 
         async def _kb_log_acl_and_update_timeline(self, acl: Dict[str, Any]) -> List[Dict[str, Any]]:
-            """
-            Dopisanie pojedynczej ramki (frame) + aktualizacja timeline z ACK, retry i RW.
-            """
             item = {
                 "ts": now_iso(),
                 "agent": str(acl.get("sender") or "").strip() or "Unknown",
@@ -495,7 +475,7 @@ class CoordinatorAgent(Agent):
         # ---------- DF ----------
         async def df_lookup(self) -> List[Any]:
             async def _query(need_value: str) -> List[Any]:
-                reply_id = f"dfq-{now_ms()}"
+                reply_id = new_reply_id("dfq")
                 msg = Message(to=self.agent.registry_jid)
                 msg.set_metadata("conv", self.conv_id)
                 msg.set_metadata("performative", "QUERY-REF")
@@ -505,6 +485,13 @@ class CoordinatorAgent(Agent):
                     conversation_id=self.conv_id,
                     reply_with=reply_id,
                     protocol="fipa-query",
+                )
+                # Rejestr oczekiwań: INFORM z DF (punkt 8)
+                self.agent.corr.register(
+                    self.conv_id, reply_id,
+                    allow_from=[bare_jid(self.agent.registry_jid)],
+                    allow_pf=["INFORM"],
+                    note="DF QUERY-REF → INFORM"
                 )
                 print(f"[COORD] {now_iso()} → DF {self.agent.registry_jid} QUERY-REF need={need_value} conv={self.conv_id}")
                 await self.send(msg)
@@ -518,7 +505,7 @@ class CoordinatorAgent(Agent):
                     except asyncio.TimeoutError:
                         continue
                     try:
-                        acl = parse_acl(m.body)
+                        acl = parse_acl_to_dict(m.body)
                     except Exception:
                         continue
                     if acl.get("conversation_id") != self.conv_id:
@@ -633,7 +620,7 @@ class CoordinatorAgent(Agent):
             return selected
 
         async def ask_specialist(self, specialist_jid: str, history: List[Dict[str, Any]]) -> Optional[str]:
-            req_id = f"ask-{now_ms()}"
+            req_id = new_reply_id("ask")
             msg = Message(to=specialist_jid)
             msg.set_metadata("conv", self.conv_id)
             msg.set_metadata("performative", "REQUEST")
@@ -642,6 +629,13 @@ class CoordinatorAgent(Agent):
                 content={"type": "ASK_EXPERT", "args": {"question": self.question, "history": history}},
                 conversation_id=self.conv_id,
                 reply_with=req_id,
+            )
+            # Rejestr oczekiwań: AGREE i INFORM z tego samego specjalisty (jedno oczekiwanie z dwoma PF)
+            self.agent.corr.register(
+                self.conv_id, req_id,
+                allow_from=[bare_jid(specialist_jid)],
+                allow_pf=["AGREE", "INFORM"],
+                note="SPEC REQUEST → AGREE/INFORM"
             )
             print(f"[COORD] {now_iso()} → SPEC {specialist_jid} REQUEST.ASK_EXPERT conv={self.conv_id} q={self.question!r}")
             await self.send(msg)
@@ -657,7 +651,7 @@ class CoordinatorAgent(Agent):
                 except asyncio.TimeoutError:
                     continue
                 try:
-                    acl = parse_acl(m.body)
+                    acl = parse_acl_to_dict(m.body)
                 except Exception:
                     continue
                 if acl.get("conversation_id") != self.conv_id:
