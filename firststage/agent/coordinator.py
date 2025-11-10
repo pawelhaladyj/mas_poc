@@ -2,6 +2,7 @@
 # Coordinator – USER_MSG -> DF lookup -> AI select (z historią z KB) ->
 # REQUEST.ASK_EXPERT (+history) -> RESULT -> PRESENTER_REPLY
 # Dodatki: logging do KB (frame + timeline), historia do AI i do specjalisty.
+# ZMIANY: szczegółowe logi KB (połączenie/cel, STORE/GET timeline, tworzenie/aktualizacja historii, dopisanie wpisu).
 
 import os
 import json
@@ -65,6 +66,7 @@ DEBUG_AI         = (_env("COORD_DEBUG_AI", default="1") or "1") == "1"
 KB_JID           = _env("KB_JID", default="kb@xmpp.pawelhaladyj.pl")
 HISTORY_LEN      = int(_env("COORD_HISTORY_LEN", default="10") or "10")
 KB_TIMEOUT_S     = int(_env("COORD_KB_TIMEOUT", default="5") or "5")
+KB_LOG_VERBOSE   = (_env("COORD_KB_LOG", default="1") or "1") == "1"  # dodatkowe logi KB
 
 # ====== helpers ======
 def now_iso() -> str:
@@ -78,6 +80,10 @@ def bare(j: Any) -> str:
         return str(j).split("/")[0]
     except Exception:
         return str(j or "")
+
+def _short(txt: str, n: int = 80) -> str:
+    t = (txt or "").replace("\n", " ").strip()
+    return t if len(t) <= n else (t[:n] + "…")
 
 def make_acl(
     performative: str, sender: str, receiver: str, content: Dict[str, Any],
@@ -124,6 +130,7 @@ class CoordinatorAgent(Agent):
         self.kb_jid = KB_JID
         self.history_len = HISTORY_LEN
         self.kb_timeout = KB_TIMEOUT_S
+        self.kb_log = KB_LOG_VERBOSE
         self.ai = AIConnector()
 
     class Dispatcher(CyclicBehaviour):
@@ -208,6 +215,9 @@ class CoordinatorAgent(Agent):
         async def _kb_store_frame_ff(self, frame: Dict[str, Any]) -> None:
             kb_conv = f"{self.conv_id}-kbframe-{now_ms()}"
             key = f"session:{self.conv_id}:chat:frame:{now_ms()}"
+            if self.agent.kb_log:
+                print(f"[COORD][KB] {now_iso()} → STORE frame key={key} conv={self.conv_id} "
+                      f"type={frame.get('type','')} from={frame.get('agent','')} text='{_short(frame.get('text',''))}'")
             body = self._kb_body(kb_conv, "STORE", {
                 "key": key,
                 "content_type": "application/json",
@@ -221,9 +231,10 @@ class CoordinatorAgent(Agent):
             kb_conv = f"{self.conv_id}-kbget-{now_ms()}"
             self.agent.conv_queues[kb_conv] = asyncio.Queue()
             try:
-                body = self._kb_body(kb_conv, "GET", {
-                    "key": f"session:{self.conv_id}:chat:timeline:main"
-                })
+                key = f"session:{self.conv_id}:chat:timeline:main"
+                if self.agent.kb_log:
+                    print(f"[COORD][KB] {now_iso()} → GET timeline key={key} conv={self.conv_id} timeout={self.agent.kb_timeout}s")
+                body = self._kb_body(kb_conv, "GET", {"key": key})
                 msg = Message(to=self.agent.kb_jid); msg.body = json.dumps(body, ensure_ascii=False)
                 await self.send(msg)
 
@@ -238,24 +249,33 @@ class CoordinatorAgent(Agent):
                         acl = json.loads(m.body or "{}")
                     except Exception:
                         continue
+                    # SUKCES: INFORM.VALUE
                     if (acl.get("ontology") == "MAS.KB"
                             and acl.get("performative") == "INFORM"
                             and (acl.get("type") == "VALUE" or (acl.get("content") or {}).get("type") == "VALUE")):
                         key_ok = (acl.get("key")
-                                  or (acl.get("content") or {}).get("key")) == f"session:{self.conv_id}:chat:timeline:main"
+                                  or (acl.get("content") or {}).get("key")) == key
                         if not key_ok:
                             continue
                         content = acl.get("value") or (acl.get("content") or {}).get("value") or []
                         version = (acl.get("version")
                                    or (acl.get("content") or {}).get("version"))
+                        if self.agent.kb_log:
+                            print(f"[COORD][KB] {now_iso()} ← VALUE timeline entries={len(content)} "
+                                  f"version={version if version is not None else 'n/a'} conv={self.conv_id}")
                         try:
                             return list(content), int(version) if version is not None else None
                         except Exception:
                             return [], None
+                    # BRAK: FAILURE.NOT_FOUND
                     if (acl.get("ontology") == "MAS.KB"
                             and acl.get("performative") == "FAILURE"
                             and str(acl.get("type", "")).upper() == "FAILURE.NOT_FOUND"):
+                        if self.agent.kb_log:
+                            print(f"[COORD][KB] {now_iso()} ← NOT_FOUND timeline (brak historii) conv={self.conv_id} — utworzę nową")
                         return [], None
+                if self.agent.kb_log:
+                    print(f"[COORD][KB] {now_iso()} !! timeout GET timeline po {self.agent.kb_timeout}s conv={self.conv_id}")
                 return [], None
             finally:
                 try:
@@ -266,6 +286,9 @@ class CoordinatorAgent(Agent):
         async def _kb_put_timeline(self, entries: List[Dict[str, Any]], if_match_version: Optional[int]) -> None:
             kb_conv = f"{self.conv_id}-kbput-{now_ms()}"
             if_match = f"v{int(if_match_version)}" if isinstance(if_match_version, int) else None
+            if self.agent.kb_log:
+                print(f"[COORD][KB] {now_iso()} → STORE timeline entries={len(entries)} "
+                      f"{'(tworzenie nowej)' if if_match is None else f'if_match={if_match}'} conv={self.conv_id}")
             body = self._kb_body(kb_conv, "STORE", {
                 "key": f"session:{self.conv_id}:chat:timeline:main",
                 "content_type": "application/json",
@@ -284,10 +307,19 @@ class CoordinatorAgent(Agent):
                 "type": str((acl.get("content") or {}).get("type") or ""),
                 "text": _history_text_from_acl(acl),
             }
+            # 1) dopisz pojedynczą ramkę jako frame (FF)
             await self._kb_store_frame_ff(item)
+            # 2) wczytaj timeline (może nie istnieć)
             curr, ver = await self._kb_get_timeline()
+            # 3) dopisz do timeline i zapisz
             curr = list(curr or [])
             curr.append(item)
+            # ogólny skrót, żeby w logach było jasne
+            if self.agent.kb_log:
+                if ver is None:
+                    print(f"[COORD][KB] {now_iso()} Historia: tworzenie pierwszej wersji (v1) conv={self.conv_id}")
+                else:
+                    print(f"[COORD][KB] {now_iso()} Historia: dopisano wpis (v{ver} -> v{ver+1}) conv={self.conv_id}")
             if self.agent.history_len > 0 and len(curr) > self.agent.history_len:
                 curr = curr[-self.agent.history_len:]
             await self._kb_put_timeline(curr, ver)
@@ -492,7 +524,7 @@ class CoordinatorAgent(Agent):
                 content={"type": "PRESENTER_REPLY", "text": text},
                 conversation_id=self.conv_id,
             )
-            print(f"[COORD] {now_iso()} → PRESENTER {self.presenter_jid} INFORM.PRESENTER_REPLY conv={self.conv_id} text={text!r}")
+            print(f"[COORD] {now_iso()} → PRESENTER {self.presenter_jid} INFORM.PRESENTER_REPLY conv={self.conv_id} text={_short(text)!r}")
             await self.send(msg)
 
         async def run(self):
@@ -566,6 +598,8 @@ class CoordinatorAgent(Agent):
               f"NEED={NEED_CAP} TIMEOUT={REQ_TIMEOUT_S}s RETRIES={MAX_RETRIES} "
               f"CONCURRENCY={MAX_CONCURRENCY} DF_MODE={DF_MODE} KB={self.kb_jid} "
               f"HIST={self.history_len}@{self.kb_timeout}s")
+        # Jasny „baner” o celu KB i trybie logów KB
+        print(f"[COORD][KB] Cel KB: {self.kb_jid} | timeout={self.kb_timeout}s | historia_max={self.history_len} | logiKB={'ON' if self.kb_log else 'OFF'}")
         self.add_behaviour(self.Dispatcher())
 
 # ====== MAIN ======

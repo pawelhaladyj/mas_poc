@@ -2,6 +2,7 @@
 # Presenter – wejście/wyjście człowieka (USER_MSG -> PRESENTER_REPLY)
 # Po staremu: SPADE, JSON-ACL, solidne logi, brak wyścigów.
 # ZMIANY: stałe conversation_id per sesja Presentera (self.session_id) + lock na sesję.
+#         Usunięto podwójne ładowanie dotenv; czytelniejszy komunikat przy timeoucie.
 
 import os
 import json
@@ -9,27 +10,16 @@ import time
 import asyncio
 from typing import Dict, Any, Optional
 
-# --- dotenv (opcjonalnie) ---
-try:
-    from dotenv import load_dotenv, find_dotenv  # pip install python-dotenv
-    _dotenv_path = find_dotenv(filename=".env", usecwd=True)
-    if _dotenv_path:
-        load_dotenv(_dotenv_path)
-    else:
-        print("[PRES] Uwaga: nie znaleziono .env (kontynuuję).")
-except Exception as e:
-    print(f"[PRES] Uwaga: problem z dotenv: {e} (kontynuuję).")
-
 from spade.agent import Agent
 from spade.message import Message
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 
-# Wariant twardszy: wymagamy .env (zostawiam jak miałeś)
-from dotenv import load_dotenv, find_dotenv
-_dotenv_path = find_dotenv(filename=".env", usecwd=True)
-if not _dotenv_path:
+# --- dotenv (wymagany plik .env) ---
+from dotenv import load_dotenv, find_dotenv  # pip install python-dotenv
+_DOTENV_PATH = find_dotenv(filename=".env", usecwd=True)
+if not _DOTENV_PATH:
     raise RuntimeError("[PRES] Brak pliku .env w drzewie projektu.")
-load_dotenv(_dotenv_path)
+load_dotenv(_DOTENV_PATH)
 
 # ====== ENV ======
 def _env(*names: str, default: Optional[str] = None) -> Optional[str]:
@@ -46,11 +36,11 @@ REQ_TIMEOUT_S   = int(_env("PRESENTER_TIMEOUT", default="15") or "15")
 CONV_GRACE_SEC  = float(_env("PRESENTER_CONV_GRACE_SEC", default="0.5") or "0.5")
 MAX_CONCURRENCY = int(_env("PRESENTER_MAX_CONCURRENCY", default="5") or "5")
 
-# Tryb pracy (jak było)
+# Tryb pracy
 QUESTION_ONESHOT = _env("PRESENTER_QUESTION", "QUESTION", default=None)
 CONV_ID_ONESHOT  = _env("PRESENTER_CONV_ID", "CONV_ID", default=None)
 
-# NOWE: możliwość narzucenia ID sesji z ENV (np. dla Streamlit)
+# Możliwość narzucenia ID sesji z ENV (np. frontend)
 SESSION_ID_ENV   = _env("PRESENTER_SESSION_ID", "PRESENTER_CONV_ID", "CONV_ID", default=None)
 
 # ====== ACL helpers ======
@@ -93,9 +83,9 @@ class PresenterAgent(Agent):
         self.conv_queues: Dict[str, asyncio.Queue] = {}
         self.sem = asyncio.Semaphore(MAX_CONCURRENCY)
         self.coordinator_jid = COORD_JID
-        # NOWE: lock na sesję, by nie mieszać ramek przy wspólnym conversation_id
+        # Lock na sesję, by nie mieszać ramek przy wspólnym conversation_id
         self.session_lock = asyncio.Lock()
-        # self.session_id ustawimy w setup(), kiedy środowisko i zegar są gotowe
+        # self.session_id ustawimy w setup()
 
     # ---------- Behawiory ----------
     class Dispatcher(CyclicBehaviour):
@@ -104,7 +94,6 @@ class PresenterAgent(Agent):
             msg = await self.receive(timeout=1)
             if not msg:
                 return
-
             try:
                 acl = parse_acl(msg.body)
             except Exception as e:
@@ -182,7 +171,9 @@ class PresenterAgent(Agent):
 
                 print(f"[PRES] {now_iso()} [CONV {self.conv_id}] niespodziewane pf={pf} typ={typ}")
 
-            print(f"[PRES] {now_iso()} [CONV {self.conv_id}] timeout po {REQ_TIMEOUT_S}s – brak PRESENTER_REPLY")
+            # Czytelniejszy komunikat dla operatora
+            print(f"[PRES] {now_iso()} [CONV {self.conv_id}] timeout po {REQ_TIMEOUT_S}s – brak PRESENTER_REPLY. "
+                  f"Sugestia: sprawdź czy Koordynator działa i ma poprawny JID ({self.agent.coordinator_jid}).")
             return None
 
         async def run(self):
