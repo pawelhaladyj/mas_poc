@@ -1,0 +1,26 @@
+# XMPP konto specjalisty
+SPECIALIST_JID="specialist@xmpp.pawelhaladyj.pl"
+SPECIALIST_PASS="Spec#Pass1"
+
+# DF/Registry
+DF_JID="registry@xmpp.pawelhaladyj.pl"
+SPEC_HEARTBEAT_SEC=30
+
+# Profil (dla DF i Koordynatora)
+SPEC_NAME="Specialist"
+SPEC_VERSION="1.0.0"
+SPEC_STATUS="ready"
+SPEC_DESCRIPTION="Specjalista AI z hookami"
+SPEC_CAPABILITIES="ASK_EXPERT"
+SPEC_SKILLS="general,python"
+
+# Własna logika (moduł:Klasa); zostaw puste, by użyć tylko AI
+SPEC_LOGIC="logic_example:MyLogic"
+
+# AI fallback (gdy hook nic nie zwróci)
+AI_BACKEND="openai"           # "openai" | "local"
+OPENAI_API_KEY="sk-..."       # gdy openai
+OPENAI_MODEL="gpt-4o-mini"    # opcjonalnie
+LOCAL_AI_CMD="python3 ./llm_cli.py --model mygguf"  # gdy local
+LOCAL_AI_TIMEOUT_S=30
+LOCAL_AI_MODEL="mygguf"
