@@ -2,12 +2,17 @@
 # Coordinator – USER_MSG -> DF lookup -> AI select (z historią z KB) ->
 # REQUEST.ASK_EXPERT (+history) -> RESULT -> PRESENTER_REPLY
 # Dodatki: logging do KB (frame + timeline), historia do AI i do specjalisty.
-# ZMIANY: szczegółowe logi KB (połączenie/cel, STORE/GET timeline, tworzenie/aktualizacja historii, dopisanie wpisu).
+# ZMIANY (2025-11-10):
+# - ACK dla STORE (frame + timeline) – oczekiwanie na INFORM {type:"STORED"}
+# - Retry/backoff (exponential + jitter) dla GET/STORE wobec KB
+# - Automatyczny read-modify-write przy FAILURE.CONFLICT na timeline (if_match)
+# - Telemetria KB: czasy i liczniki (best-effort, z adapterem metryk)
 
 import os
 import json
 import time
 import asyncio
+import random
 from typing import Dict, Any, Optional, List, Tuple
 
 # --- dotenv (opcjonalnie) ---
@@ -27,12 +32,37 @@ from spade.message import Message
 from spade.behaviour import CyclicBehaviour, OneShotBehaviour
 
 # --- AI Connector ---
-from utils.aiconnector import AIConnector
+from firststage.utils.aiconnector import AIConnector  # ścieżka zgodna z drzewem projektu
+
+# --- Metryki (best-effort adapter wspólnego modułu) ---
+class _NoopMetrics:
+    enabled = False
+    # KB STORE
+    def store_ok_ms(self, *_a, **_k): pass
+    def store_conflict(self, *_a, **_k): pass
+    def store_exc(self, *_a, **_k): pass
+    # KB GET
+    def get_ok_ms(self, *_a, **_k): pass
+    def get_not_found(self, *_a, **_k): pass
+    def get_exc(self, *_a, **_k): pass
+
+def _load_kb_metrics():
+    try:
+        from firststage.kb.metrics import KBMetrics  # type: ignore
+        m = KBMetrics()
+        # minimalny sanity check
+        _ = getattr(m, "store_ok_ms")
+        _ = getattr(m, "get_ok_ms")
+        return m
+    except Exception:
+        return _NoopMetrics()
+
+kb_metrics = _load_kb_metrics()
 
 # --- System prompt (z historią) ---
 SELECTOR_SYSTEM_PROMPT: Optional[str] = None
 try:
-    from systemprompt import SELECTOR_SYSTEM_PROMPT as _SP  # type: ignore
+    from firststage.notes.systemprompt import SELECTOR_SYSTEM_PROMPT as _SP  # zgodnie z drzewem
     SELECTOR_SYSTEM_PROMPT = _SP
 except Exception:
     SELECTOR_SYSTEM_PROMPT = (
@@ -68,6 +98,11 @@ HISTORY_LEN      = int(_env("COORD_HISTORY_LEN", default="10") or "10")
 KB_TIMEOUT_S     = int(_env("COORD_KB_TIMEOUT", default="5") or "5")
 KB_LOG_VERBOSE   = (_env("COORD_KB_LOG", default="1") or "1") == "1"  # dodatkowe logi KB
 
+# --- Retry/backoff dla KB ---
+KB_MAX_TRIES     = int(_env("COORD_KB_MAX_TRIES", default="3") or "3")          # ile prób GET/STORE
+KB_BACKOFF_BASE  = float(_env("COORD_KB_BACKOFF_BASE", default="0.2") or "0.2") # sekundy (expo)
+KB_BACKOFF_MAX   = float(_env("COORD_KB_BACKOFF_MAX", default="1.2") or "1.2")  # sekundy (limit)
+
 # ====== helpers ======
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -84,6 +119,12 @@ def bare(j: Any) -> str:
 def _short(txt: str, n: int = 80) -> str:
     t = (txt or "").replace("\n", " ").strip()
     return t if len(t) <= n else (t[:n] + "…")
+
+def _exp_backoff_sleep(attempt: int) -> float:
+    # decorrelated jitter: base * 2^(n-1) + U(0, base/2), z limitem
+    expo = KB_BACKOFF_BASE * (2 ** max(0, attempt - 1))
+    jitter = random.uniform(0.0, KB_BACKOFF_BASE * 0.5)
+    return min(KB_BACKOFF_MAX, expo + jitter)
 
 def make_acl(
     performative: str, sender: str, receiver: str, content: Dict[str, Any],
@@ -132,6 +173,12 @@ class CoordinatorAgent(Agent):
         self.kb_timeout = KB_TIMEOUT_S
         self.kb_log = KB_LOG_VERBOSE
         self.ai = AIConnector()
+        # liczniki (lokalne)
+        self.kb_store_ok = 0
+        self.kb_store_conflict = 0
+        self.kb_store_timeout = 0
+        self.kb_get_ok = 0
+        self.kb_get_timeout = 0
 
     class Dispatcher(CyclicBehaviour):
         async def run(self):
@@ -196,7 +243,7 @@ class CoordinatorAgent(Agent):
             self.conv_id = conv_id
             self.orig_acl = orig_acl
 
-        # ---------- KB helpery (TU, w behawiorze!) ----------
+        # ---------- KB helpery ----------
         def _kb_body(self, kb_conv: str, typ: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             body = {
                 "performative": "REQUEST",
@@ -212,94 +259,211 @@ class CoordinatorAgent(Agent):
             body.update(payload)
             return body
 
-        async def _kb_store_frame_ff(self, frame: Dict[str, Any]) -> None:
-            kb_conv = f"{self.conv_id}-kbframe-{now_ms()}"
+        async def _kb_wait_for(self, kb_conv: str, *, want_types: List[str], timeout: float) -> Optional[Dict[str, Any]]:
+            q = self.agent.conv_queues.setdefault(kb_conv, asyncio.Queue())
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                try:
+                    m = await asyncio.wait_for(q.get(), timeout=max(0.05, min(1.0, deadline - time.time())))
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    acl = json.loads(m.body or "{}")
+                except Exception:
+                    continue
+                if (acl.get("ontology") == "MAS.KB"
+                        and acl.get("conversation_id") == kb_conv
+                        and str(acl.get("type", "")).upper() in [t.upper() for t in want_types]):
+                    return acl
+            return None
+
+        async def _kb_store_frame_ack(self, frame: Dict[str, Any]) -> bool:
+            """
+            STORE (frame) z oczekiwaniem na INFORM {type: STORED}.
+            Klucz unikalny -> konflikt mało prawdopodobny; retry/backoff przy timeoutach.
+            """
             key = f"session:{self.conv_id}:chat:frame:{now_ms()}"
-            if self.agent.kb_log:
-                print(f"[COORD][KB] {now_iso()} → STORE frame key={key} conv={self.conv_id} "
-                      f"type={frame.get('type','')} from={frame.get('agent','')} text='{_short(frame.get('text',''))}'")
-            body = self._kb_body(kb_conv, "STORE", {
+            payload = {
                 "key": key,
                 "content_type": "application/json",
                 "value": frame,
-                "tags": [f"conv:{self.conv_id}", f"type:{frame.get('type','').lower()}", f"from:{frame.get('agent','').lower()}"],
-            })
-            msg = Message(to=self.agent.kb_jid); msg.body = json.dumps(body, ensure_ascii=False)
-            await self.send(msg)
-
-        async def _kb_get_timeline(self) -> Tuple[List[Dict[str, Any]], Optional[int]]:
-            kb_conv = f"{self.conv_id}-kbget-{now_ms()}"
-            self.agent.conv_queues[kb_conv] = asyncio.Queue()
-            try:
-                key = f"session:{self.conv_id}:chat:timeline:main"
+                "tags": [f"conv:{self.conv_id}", f"type:{(frame.get('type','') or '').lower()}", f"from:{(frame.get('agent','') or '').lower()}"],
+            }
+            attempt = 0
+            while attempt < KB_MAX_TRIES:
+                attempt += 1
+                kb_conv = f"{self.conv_id}-kbframe-{now_ms()}"
                 if self.agent.kb_log:
-                    print(f"[COORD][KB] {now_iso()} → GET timeline key={key} conv={self.conv_id} timeout={self.agent.kb_timeout}s")
-                body = self._kb_body(kb_conv, "GET", {"key": key})
+                    print(f"[COORD][KB] {now_iso()} → STORE(frame) attempt={attempt}/{KB_MAX_TRIES} key={key} conv={self.conv_id}")
+                body = self._kb_body(kb_conv, "STORE", payload)
+                t0 = time.perf_counter()
+                try:
+                    msg = Message(to=self.agent.kb_jid); msg.body = json.dumps(body, ensure_ascii=False)
+                    await self.send(msg)
+                    acl = await self._kb_wait_for(kb_conv, want_types=["STORED", "FAILURE.CONFLICT", "FAILURE.EXCEPTION"], timeout=self.agent.kb_timeout)
+                finally:
+                    self.agent.conv_queues.pop(kb_conv, None)
+                if not acl:
+                    self.agent.kb_store_timeout += 1
+                    kb_metrics.store_exc()  # timeout traktujemy jak błąd po stronie operacji
+                    if self.agent.kb_log:
+                        print(f"[COORD][KB] {now_iso()} !! timeout STORE(frame) conv={self.conv_id}")
+                    await asyncio.sleep(_exp_backoff_sleep(attempt))
+                    continue
+                t = str(acl.get("type","")).upper()
+                if t == "STORED":
+                    dt_ms = int((time.perf_counter() - t0) * 1000)
+                    self.agent.kb_store_ok += 1
+                    kb_metrics.store_ok_ms(dt_ms)
+                    if self.agent.kb_log:
+                        print(f"[COORD][KB] {now_iso()} ← STORED frame v={acl.get('version')} etag={acl.get('etag')} conv={self.conv_id} ({dt_ms} ms)")
+                    return True
+                if t == "FAILURE.CONFLICT":
+                    self.agent.kb_store_conflict += 1
+                    kb_metrics.store_conflict()
+                    if self.agent.kb_log:
+                        print(f"[COORD][KB] {now_iso()} CONFLICT na frame (nietypowe). Ponawiam z nowym ts. conv={self.conv_id}")
+                    key = f"session:{self.conv_id}:chat:frame:{now_ms()}"
+                    payload["key"] = key
+                    await asyncio.sleep(_exp_backoff_sleep(attempt))
+                    continue
+                # FAILURE.EXCEPTION lub inne
+                kb_metrics.store_exc()
+                if self.agent.kb_log:
+                    print(f"[COORD][KB] {now_iso()} FAILURE na STORE(frame): {acl}")
+                return False
+            return False
+
+        async def _kb_get_timeline_once(self) -> Tuple[List[Dict[str, Any]], Optional[int], bool]:
+            """Pojedyncza próba GET timeline. Zwraca (entries, version, success_flag)."""
+            kb_conv = f"{self.conv_id}-kbget-{now_ms()}"
+            key = f"session:{self.conv_id}:chat:timeline:main"
+            if self.agent.kb_log:
+                print(f"[COORD][KB] {now_iso()} → GET timeline key={key} conv={self.conv_id} timeout={self.agent.kb_timeout}s")
+            body = self._kb_body(kb_conv, "GET", {"key": key})
+            t0 = time.perf_counter()
+            try:
                 msg = Message(to=self.agent.kb_jid); msg.body = json.dumps(body, ensure_ascii=False)
                 await self.send(msg)
-
-                q = self.agent.conv_queues[kb_conv]
-                deadline = time.time() + self.agent.kb_timeout
-                while time.time() < deadline:
-                    try:
-                        m = await asyncio.wait_for(q.get(), timeout=min(1.0, deadline - time.time()))
-                    except asyncio.TimeoutError:
-                        continue
-                    try:
-                        acl = json.loads(m.body or "{}")
-                    except Exception:
-                        continue
-                    # SUKCES: INFORM.VALUE
-                    if (acl.get("ontology") == "MAS.KB"
-                            and acl.get("performative") == "INFORM"
-                            and (acl.get("type") == "VALUE" or (acl.get("content") or {}).get("type") == "VALUE")):
-                        key_ok = (acl.get("key")
-                                  or (acl.get("content") or {}).get("key")) == key
-                        if not key_ok:
-                            continue
-                        content = acl.get("value") or (acl.get("content") or {}).get("value") or []
-                        version = (acl.get("version")
-                                   or (acl.get("content") or {}).get("version"))
-                        if self.agent.kb_log:
-                            print(f"[COORD][KB] {now_iso()} ← VALUE timeline entries={len(content)} "
-                                  f"version={version if version is not None else 'n/a'} conv={self.conv_id}")
-                        try:
-                            return list(content), int(version) if version is not None else None
-                        except Exception:
-                            return [], None
-                    # BRAK: FAILURE.NOT_FOUND
-                    if (acl.get("ontology") == "MAS.KB"
-                            and acl.get("performative") == "FAILURE"
-                            and str(acl.get("type", "")).upper() == "FAILURE.NOT_FOUND"):
-                        if self.agent.kb_log:
-                            print(f"[COORD][KB] {now_iso()} ← NOT_FOUND timeline (brak historii) conv={self.conv_id} — utworzę nową")
-                        return [], None
-                if self.agent.kb_log:
-                    print(f"[COORD][KB] {now_iso()} !! timeout GET timeline po {self.agent.kb_timeout}s conv={self.conv_id}")
-                return [], None
+                acl = await self._kb_wait_for(kb_conv, want_types=["VALUE", "FAILURE.NOT_FOUND", "FAILURE.EXCEPTION"], timeout=self.agent.kb_timeout)
             finally:
-                try:
-                    self.agent.conv_queues.pop(kb_conv, None)
-                except Exception:
-                    pass
+                self.agent.conv_queues.pop(kb_conv, None)
 
-        async def _kb_put_timeline(self, entries: List[Dict[str, Any]], if_match_version: Optional[int]) -> None:
-            kb_conv = f"{self.conv_id}-kbput-{now_ms()}"
-            if_match = f"v{int(if_match_version)}" if isinstance(if_match_version, int) else None
+            if not acl:
+                self.agent.kb_get_timeout += 1
+                kb_metrics.get_exc()
+                if self.agent.kb_log:
+                    print(f"[COORD][KB] {now_iso()} !! timeout GET timeline conv={self.conv_id}")
+                return [], None, False
+
+            t = str(acl.get("type","")).upper()
+            if t == "VALUE":
+                dt_ms = int((time.perf_counter() - t0) * 1000)
+                content = acl.get("value") or []
+                version = acl.get("version")
+                self.agent.kb_get_ok += 1
+                kb_metrics.get_ok_ms(dt_ms)
+                if self.agent.kb_log:
+                    print(f"[COORD][KB] {now_iso()} ← VALUE timeline entries={len(content)} version={version} conv={self.conv_id} ({dt_ms} ms)")
+                try:
+                    return list(content), int(version) if version is not None else None, True
+                except Exception:
+                    return [], None, True
+            if t == "FAILURE.NOT_FOUND":
+                kb_metrics.get_not_found()
+                if self.agent.kb_log:
+                    print(f"[COORD][KB] {now_iso()} ← NOT_FOUND timeline (brak historii) conv={self.conv_id}")
+                return [], None, True
+            kb_metrics.get_exc()
             if self.agent.kb_log:
-                print(f"[COORD][KB] {now_iso()} → STORE timeline entries={len(entries)} "
-                      f"{'(tworzenie nowej)' if if_match is None else f'if_match={if_match}'} conv={self.conv_id}")
-            body = self._kb_body(kb_conv, "STORE", {
-                "key": f"session:{self.conv_id}:chat:timeline:main",
-                "content_type": "application/json",
-                "value": entries,
-                "tags": [f"conv:{self.conv_id}", "kind:timeline"],
-                "if_match": if_match,
-            })
-            msg = Message(to=self.agent.kb_jid); msg.body = json.dumps(body, ensure_ascii=False)
-            await self.send(msg)
+                print(f"[COORD][KB] {now_iso()} ← FAILURE GET timeline: {acl}")
+            return [], None, False
+
+        async def _kb_get_timeline(self) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+            """GET timeline z retry/backoff."""
+            attempt = 0
+            while attempt < KB_MAX_TRIES:
+                attempt += 1
+                entries, ver, ok = await self._kb_get_timeline_once()
+                if ok:
+                    return entries, ver
+                await asyncio.sleep(_exp_backoff_sleep(attempt))
+            return [], None
+
+        async def _kb_put_timeline_rw(self, entries: List[Dict[str, Any]], if_match_version: Optional[int]) -> bool:
+            """
+            STORE timeline z oczekiwaniem na ACK (STORED) i read-modify-write przy CONFLICT.
+            """
+            key = f"session:{self.conv_id}:chat:timeline:main"
+            attempt = 0
+            current_entries = entries
+            current_if_match = f"v{int(if_match_version)}" if isinstance(if_match_version, int) else None
+
+            while attempt < KB_MAX_TRIES:
+                attempt += 1
+                kb_conv = f"{self.conv_id}-kbput-{now_ms()}"
+                if self.agent.kb_log:
+                    print(f"[COORD][KB] {now_iso()} → STORE(timeline) attempt={attempt}/{KB_MAX_TRIES} "
+                          f"{'(tworzenie nowej)' if current_if_match is None else f'if_match={current_if_match}'} conv={self.conv_id}")
+                body = self._kb_body(kb_conv, "STORE", {
+                    "key": key,
+                    "content_type": "application/json",
+                    "value": current_entries,
+                    "tags": [f"conv:{self.conv_id}", "kind:timeline"],
+                    "if_match": current_if_match,
+                })
+                t0 = time.perf_counter()
+                try:
+                    msg = Message(to=self.agent.kb_jid); msg.body = json.dumps(body, ensure_ascii=False)
+                    await self.send(msg)
+                    acl = await self._kb_wait_for(kb_conv, want_types=["STORED", "FAILURE.CONFLICT", "FAILURE.EXCEPTION"], timeout=self.agent.kb_timeout)
+                finally:
+                    self.agent.conv_queues.pop(kb_conv, None)
+
+                if not acl:
+                    self.agent.kb_store_timeout += 1
+                    kb_metrics.store_exc()
+                    if self.agent.kb_log:
+                        print(f"[COORD][KB] {now_iso()} !! timeout STORE(timeline) conv={self.conv_id}")
+                    await asyncio.sleep(_exp_backoff_sleep(attempt))
+                    continue
+
+                t = str(acl.get("type","")).upper()
+                if t == "STORED":
+                    dt_ms = int((time.perf_counter() - t0) * 1000)
+                    self.agent.kb_store_ok += 1
+                    kb_metrics.store_ok_ms(dt_ms)
+                    if self.agent.kb_log:
+                        print(f"[COORD][KB] {now_iso()} ← STORED timeline v={acl.get('version')} etag={acl.get('etag')} conv={self.conv_id} ({dt_ms} ms)")
+                    return True
+
+                if t == "FAILURE.CONFLICT":
+                    self.agent.kb_store_conflict += 1
+                    kb_metrics.store_conflict()
+                    if self.agent.kb_log:
+                        print(f"[COORD][KB] {now_iso()} CONFLICT timeline – odczyt i ponowna próba conv={self.conv_id}")
+                    curr, ver = await self._kb_get_timeline()
+                    merged = list(curr or [])
+                    merged.extend([e for e in current_entries if e not in merged])
+                    if self.agent.history_len > 0 and len(merged) > self.agent.history_len:
+                        merged = merged[-self.agent.history_len:]
+                    current_entries = merged
+                    current_if_match = f"v{int(ver)}" if isinstance(ver, int) else None
+                    await asyncio.sleep(_exp_backoff_sleep(attempt))
+                    continue
+
+                # FAILURE.EXCEPTION lub inne – przerwij
+                kb_metrics.store_exc()
+                if self.agent.kb_log:
+                    print(f"[COORD][KB] {now_iso()} FAILURE STORE(timeline): {acl}")
+                return False
+
+            return False
 
         async def _kb_log_acl_and_update_timeline(self, acl: Dict[str, Any]) -> List[Dict[str, Any]]:
+            """
+            Dopisanie pojedynczej ramki (frame) + aktualizacja timeline z ACK, retry i RW.
+            """
             item = {
                 "ts": now_iso(),
                 "agent": str(acl.get("sender") or "").strip() or "Unknown",
@@ -307,14 +471,13 @@ class CoordinatorAgent(Agent):
                 "type": str((acl.get("content") or {}).get("type") or ""),
                 "text": _history_text_from_acl(acl),
             }
-            # 1) dopisz pojedynczą ramkę jako frame (FF)
-            await self._kb_store_frame_ff(item)
-            # 2) wczytaj timeline (może nie istnieć)
+            ok_frame = await self._kb_store_frame_ack(item)
+            if not ok_frame and self.agent.kb_log:
+                print(f"[COORD][KB] {now_iso()} Ostrzeżenie: frame niepotwierdzony (kontynuuję). conv={self.conv_id}")
+
             curr, ver = await self._kb_get_timeline()
-            # 3) dopisz do timeline i zapisz
             curr = list(curr or [])
             curr.append(item)
-            # ogólny skrót, żeby w logach było jasne
             if self.agent.kb_log:
                 if ver is None:
                     print(f"[COORD][KB] {now_iso()} Historia: tworzenie pierwszej wersji (v1) conv={self.conv_id}")
@@ -322,7 +485,11 @@ class CoordinatorAgent(Agent):
                     print(f"[COORD][KB] {now_iso()} Historia: dopisano wpis (v{ver} -> v{ver+1}) conv={self.conv_id}")
             if self.agent.history_len > 0 and len(curr) > self.agent.history_len:
                 curr = curr[-self.agent.history_len:]
-            await self._kb_put_timeline(curr, ver)
+
+            ok_tl = await self._kb_put_timeline_rw(curr, ver)
+            if not ok_tl and self.agent.kb_log:
+                print(f"[COORD][KB] {now_iso()} Błąd zapisu timeline (po próbach). conv={self.conv_id}")
+
             return curr
 
         # ---------- DF ----------
@@ -531,7 +698,7 @@ class CoordinatorAgent(Agent):
             async with self.agent.sem:
                 print(f"[COORD] {now_iso()} [CONV {self.conv_id}] start")
                 try:
-                    # (0) Zaloguj USER_MSG do KB i uaktualnij timeline
+                    # (0) Zaloguj USER_MSG do KB i uaktualnij timeline (z ACK/RW)
                     history_after_user = await self._kb_log_acl_and_update_timeline(self.orig_acl)
 
                     # (1) DF lookup (+log DF INFORM do KB)
@@ -598,8 +765,11 @@ class CoordinatorAgent(Agent):
               f"NEED={NEED_CAP} TIMEOUT={REQ_TIMEOUT_S}s RETRIES={MAX_RETRIES} "
               f"CONCURRENCY={MAX_CONCURRENCY} DF_MODE={DF_MODE} KB={self.kb_jid} "
               f"HIST={self.history_len}@{self.kb_timeout}s")
-        # Jasny „baner” o celu KB i trybie logów KB
         print(f"[COORD][KB] Cel KB: {self.kb_jid} | timeout={self.kb_timeout}s | historia_max={self.history_len} | logiKB={'ON' if self.kb_log else 'OFF'}")
+        if getattr(kb_metrics, "enabled", False):
+            print("[COORD][KB] Metryki: WŁĄCZONE")
+        else:
+            print("[COORD][KB] Metryki: wyłączone (noop)")
         self.add_behaviour(self.Dispatcher())
 
 # ====== MAIN ======

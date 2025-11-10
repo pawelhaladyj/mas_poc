@@ -4,6 +4,7 @@
 #                session:{conv_id}:chat:timeline:main
 # - if_match: "vN" lub ETag (uuid)
 # - odpowiedzi: INFORM {type: STORED|VALUE, key, version, etag, content_type, value, stored_at}
+# ZMIANY: wpięte metryki (czas operacji i liczniki) oraz ostrzeżenia konfiguracyjne.
 
 import os
 import re
@@ -23,6 +24,29 @@ try:
         print("[KB] Uwaga: nie znaleziono .env (kontynuuję).")
 except Exception as e:
     print(f"[KB] Uwaga: problem z dotenv: {e} (kontynuuję).")
+
+# --- metryki (best-effort adapter) ---
+class _NoopMetrics:
+    enabled = False
+    def store_ok_ms(self, *_a, **_k): pass
+    def store_conflict(self, *_a, **_k): pass
+    def store_exc(self, *_a, **_k): pass
+    def get_ok_ms(self, *_a, **_k): pass
+    def get_not_found(self, *_a, **_k): pass
+    def get_exc(self, *_a, **_k): pass
+    def refuse_unauthorized(self, *_a, **_k): pass
+    def invalid_key(self, *_a, **_k): pass
+
+def _load_metrics():
+    try:
+        # Preferowana ścieżka (repo wg drzewa): firststage/kb/metrics.py
+        from firststage.kb.metrics import KBMetrics  # type: ignore
+        return KBMetrics()
+    except Exception:
+        # Fallback – brak metryk nie blokuje agenta
+        return _NoopMetrics()
+
+kb_metrics = _load_metrics()
 
 from spade.agent import Agent
 from spade.message import Message
@@ -235,6 +259,17 @@ class ConflictError(Exception):
 
 # ====== AGENT ======
 class KBCycle(CyclicBehaviour):
+    async def on_start(self):
+        # Ostrzeżenia konfiguracyjne
+        if str(KB_VERIFY_SECURITY).strip() == "0":
+            print("[KB][WARN] KB_VERIFY_SECURITY=0 — połączenia XMPP bez ścisłego TLS. Używaj tylko w DEV.")
+        if not str(KB_ALLOWED_COORDINATOR_JID or "").strip():
+            print("[KB][WARN] KB_ALLOWED_COORDINATOR_JID jest pusty — whitelist wyłączony!")
+        if not isinstance(kb_metrics, _NoopMetrics) and getattr(kb_metrics, "enabled", True):
+            print("[KB] Metryki: WŁĄCZONE")
+        else:
+            print("[KB] Metryki: wyłączone (noop)")
+
     async def run(self):
         msg = await self.receive(timeout=1)
         if not msg:
@@ -260,6 +295,7 @@ class KBCycle(CyclicBehaviour):
 
         # Whitelist — tylko Koordynator
         if sender_bare != self.agent.allowed_bare:
+            kb_metrics.refuse_unauthorized()
             await self._reply_refuse(msg, conv, code="REFUSE.UNAUTHORIZED", reason=f"Only {self.agent.allowed_bare}")
             return
 
@@ -284,6 +320,7 @@ class KBCycle(CyclicBehaviour):
         if_match = self._extract(p, "if_match", None)
 
         if not KEY_RE.match(key or ""):
+            kb_metrics.invalid_key()
             await self._reply_failure(msg, conv, code="FAILURE.INVALID_KEY",
                                       reason="Key must have 5 segments and allowed chars [a-z0-9._-]")
             return
@@ -293,6 +330,7 @@ class KBCycle(CyclicBehaviour):
         if len(parts) >= 2 and parts[0] == "session":
             session_id = parts[1]
 
+        t0 = time.perf_counter()
         try:
             version, etag, stored_at = await asyncio.to_thread(
                 self.agent.storage.store,
@@ -300,6 +338,8 @@ class KBCycle(CyclicBehaviour):
                 created_by=(bare(getattr(msg, "sender", None)) or self.agent.allowed_bare),
                 if_match=if_match,
             )
+            dt_ms = int((time.perf_counter() - t0) * 1000)
+            kb_metrics.store_ok_ms(dt_ms)
             await self._reply_inform(msg, conv, {
                 "type": "STORED",
                 "key": key,
@@ -308,10 +348,12 @@ class KBCycle(CyclicBehaviour):
                 "stored_at": stored_at,
             })
             if self.agent.log_info:
-                print(f"[KB] {now_iso()} STORED key={key} v={version} etag={etag} conv={conv}")
+                print(f"[KB] {now_iso()} STORED key={key} v={version} etag={etag} conv={conv} ({dt_ms} ms)")
         except ConflictError as e:
+            kb_metrics.store_conflict()
             await self._reply_failure(msg, conv, code="FAILURE.CONFLICT", reason=str(e))
         except Exception as e:
+            kb_metrics.store_exc()
             await self._reply_failure(msg, conv, code="FAILURE.EXCEPTION", reason=str(e))
 
     async def _handle_get(self, msg: Message, p: Dict[str, Any], conv: Optional[str]):
@@ -321,10 +363,12 @@ class KBCycle(CyclicBehaviour):
         as_of = self._extract(p, "as_of", None)
 
         if not KEY_RE.match(key or ""):
+            kb_metrics.invalid_key()
             await self._reply_failure(msg, conv, code="FAILURE.INVALID_KEY",
                                       reason="Key must have 5 segments and allowed chars [a-z0-9._-]")
             return
 
+        t0 = time.perf_counter()
         try:
             vnum = None
             if isinstance(version, int):
@@ -335,6 +379,8 @@ class KBCycle(CyclicBehaviour):
             content_type, value, ver, etag, stored_at = await asyncio.to_thread(
                 self.agent.storage.get, key, prefer, vnum, as_of
             )
+            dt_ms = int((time.perf_counter() - t0) * 1000)
+            kb_metrics.get_ok_ms(dt_ms)
             await self._reply_inform(msg, conv, {
                 "type": "VALUE",
                 "key": key,
@@ -345,10 +391,12 @@ class KBCycle(CyclicBehaviour):
                 "stored_at": stored_at,
             })
             if self.agent.log_info:
-                print(f"[KB] {now_iso()} VALUE key={key} v={ver} conv={conv}")
+                print(f"[KB] {now_iso()} VALUE key={key} v={ver} conv={conv} ({dt_ms} ms)")
         except NotFoundError as e:
+            kb_metrics.get_not_found()
             await self._reply_failure(msg, conv, code="FAILURE.NOT_FOUND", reason=str(e))
         except Exception as e:
+            kb_metrics.get_exc()
             await self._reply_failure(msg, conv, code="FAILURE.EXCEPTION", reason=str(e))
 
     async def _reply_inform(self, msg: Message, conv: Optional[str], content: Dict[str, Any]):
